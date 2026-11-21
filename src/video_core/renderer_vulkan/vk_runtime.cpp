@@ -1,14 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/alignment.h"
-#include "core/emulator_settings.h"
+#include "common/debug.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
-#include "video_core/skipcache/skipcache.h"
 #include "video_core/texture_cache/blit_helper.h"
 #include "video_core/texture_cache/image.h"
 
@@ -104,7 +105,6 @@ Runtime::Runtime(const Instance& instance_, Scheduler& scheduler_)
     memory_barrier.dstStageMask = vk::PipelineStageFlagBits2::eAllCommands;
     memory_barrier.dstAccessMask =
         vk::AccessFlagBits2::eMemoryRead | vk::AccessFlagBits2::eMemoryWrite;
-    covered_range_skip = EmulatorSettings.IsCoveredRangeSkip();
 }
 
 void Runtime::TickFrame() {
@@ -167,17 +167,32 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
                       vk::PipelineStageFlags2 dst_stage, vk::AccessFlags2 dst_access,
                       std::optional<VideoCore::SubresourceRange> subres_range) {
     const size_t prev_num_barriers = static_cast<size_t>(image_barriers.size());
-    if (dst_access & vk::AccessFlagBits2::eTransferWrite) {
-        image->InvalidateSubrects();
+    image->GetBarriers(image_barriers, dst_layout, dst_access, dst_stage, subres_range);
+    const bool transitioned = image_barriers.size() != prev_num_barriers;
+    for (size_t index = prev_num_barriers; index < image_barriers.size();) {
+        const auto& next = image_barriers[index];
+        const auto pending = std::find_if(
+            image_barriers.begin(), image_barriers.begin() + index, [&](const auto& barrier) {
+                return barrier.image == next.image &&
+                       barrier.subresourceRange == next.subresourceRange;
+            });
+        if (pending == image_barriers.begin() + index) {
+            ++index;
+            continue;
+        }
+        pending->newLayout = next.newLayout;
+        pending->dstStageMask |= next.dstStageMask;
+        pending->dstAccessMask |= next.dstAccessMask;
+        image_barriers.erase(image_barriers.begin() + index);
     }
-    image->GetBarriers(image_barriers, *image->backing, dst_layout, dst_access, dst_stage,
-                       subres_range);
-    return image_barriers.size() != prev_num_barriers;
+    return transitioned;
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
-    SetBackingSamples(dst, dst->info.num_samples, false);
+    if (dst->info.num_samples == 1) {
+        SetBackingSamples(dst, 1, false);
+    }
     scheduler.EndRendering();
 
     bool needs_flush =
@@ -242,10 +257,13 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
-    const u32 base_depth =
-        dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
+    const u32 base_width = std::min(src->info.size.width, dst->info.size.width);
+    const u32 base_height = std::min(src->info.size.height, dst->info.size.height);
+    const bool both_3d = src->info.type == AmdGpu::ImageType::Color3D &&
+                         dst->info.type == AmdGpu::ImageType::Color3D;
+    const u32 base_depth = both_3d ? std::min(src->info.size.depth, dst->info.size.depth)
+                           : dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth
+                                                                          : src->info.size.depth;
 
     // Match sample count before copying
     SetBackingSamples(dst, dst->info.num_samples, false);
@@ -327,51 +345,6 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
 
     dst->flags |= (src->flags & VideoCore::ImageFlagBits::GpuModified);
     dst->flags &= ~VideoCore::ImageFlagBits::Dirty;
-}
-
-VideoCore::ImageView& Runtime::FindSubrectView(VideoCore::Image& image,
-                                               const VideoCore::ImageInfo& info,
-                                               const VideoCore::ImageViewInfo& view_info) {
-    ASSERT(info.IsSubrectOf(image.info));
-    SetBackingSamples(&image, info.num_samples);
-
-    auto create_info = image.backing->image.image_ci;
-    create_info.extent = vk::Extent3D{info.size.width, info.size.height, 1};
-    auto it = std::ranges::find_if(image.backing_images, [&](const auto& backing) {
-        return backing.image.image_ci.extent == create_info.extent &&
-               backing.num_samples == info.num_samples;
-    });
-    auto& crop =
-        it != image.backing_images.end() ? *it : image.AddBacking(create_info, info.num_samples);
-    if (!crop.subrect_valid) {
-        scheduler.EndRendering();
-        const auto source_state = image.backing->state;
-        Transit(&image, vk::ImageLayout::eTransferSrcOptimal, vk::PipelineStageFlagBits2::eCopy,
-                vk::AccessFlagBits2::eTransferRead);
-        image.GetBarriers(image_barriers, crop, vk::ImageLayout::eTransferDstOptimal,
-                          vk::AccessFlagBits2::eTransferWrite, vk::PipelineStageFlagBits2::eCopy);
-        FlushBarriers();
-
-        const vk::ImageCopy copy{
-            .srcSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-            .dstSubresource = {vk::ImageAspectFlagBits::eColor, 0, 0, 1},
-            .extent = create_info.extent,
-        };
-        scheduler.CommandBuffer().copyImage(image.GetImage(), vk::ImageLayout::eTransferSrcOptimal,
-                                            crop.image, vk::ImageLayout::eTransferDstOptimal, copy);
-
-        // A full-size view can already be bound in the same draw.
-        if (image.binding.is_bound && source_state.layout != vk::ImageLayout::eUndefined) {
-            Transit(&image, source_state.layout, source_state.pl_stage, source_state.access_mask);
-        }
-        image.GetBarriers(image_barriers, crop, vk::ImageLayout::eShaderReadOnlyOptimal,
-                          vk::AccessFlagBits2::eShaderRead,
-                          vk::PipelineStageFlagBits2::eAllCommands);
-        FlushBarriers();
-        crop.subrect_valid = true;
-    }
-
-    return image.FindView(view_info, crop);
 }
 
 void Runtime::CopyImageWithBuffer(VideoCore::Image* src, VideoCore::Image* dst,
@@ -678,14 +651,21 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
     }
     ASSERT_MSG(!image->info.props.is_depth, "Swapping samples is only valid for color images");
     VideoCore::Image::BackingImage* new_backing;
-    const auto extent = backing->image.image_ci.extent;
-    auto it = std::ranges::find_if(backing_images, [&](const auto& candidate) {
-        return candidate.num_samples == num_samples && candidate.image.image_ci.extent == extent;
-    });
+    auto it = std::ranges::find(backing_images, num_samples,
+                                &VideoCore::Image::BackingImage::num_samples);
     if (it == backing_images.end()) {
+        const auto previous_size = Common::AlignUp(image->SizeBytes(), 1024);
         auto new_image_ci = backing->image.image_ci;
         new_image_ci.samples = LiverpoolToVK::NumSamples(num_samples, image->supported_samples);
-        new_backing = &image->AddBacking(new_image_ci, num_samples);
+
+        new_backing = &backing_images.emplace_back();
+        new_backing->num_samples = num_samples;
+        new_backing->image = VideoCore::UniqueImage{instance.GetDevice(), instance.GetAllocator()};
+        new_backing->image.Create(new_image_ci, num_samples > 1, num_samples > 1);
+        if (image->memory_usage_counter) {
+            *image->memory_usage_counter +=
+                Common::AlignUp(image->SizeBytes(), 1024) - previous_size;
+        }
 
         Vulkan::SetObjectName(instance.GetDevice(), new_backing->image.image,
                               "Image {}x{}x{} {} {} {:#x}:{:#x} L:{} M:{} S:{} (backing)",
@@ -740,25 +720,14 @@ void Runtime::SetBackingSamples(VideoCore::Image* image, u32 num_samples, bool c
         // Update current layout in tracker to new backings layout
         new_backing->state.layout = dst_layout;
         new_backing->state.access_mask = dst_access;
-        // A reused backing keeps its old barrier memo; the state just changed
-        // underneath it.
-        ++new_backing->state_epoch;
-        VideoCore::Skipcache::Framework::Instance().BumpLayoutGen();
         new_backing->state.pl_stage = dst_stage;
     }
 
-    image->InvalidateSubrects();
     backing = new_backing;
-    image->backing_num_samples = new_backing->num_samples;
-    image->backing_epoch = new_backing->state_epoch;
 }
 
 bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 size,
                                bool check_read_access) {
-    // The untracked buffer only ever reports reads, so its write list was always empty.
-    if (handle == untracked_buffer) {
-        return false;
-    }
     MakeCurrent(handle);
     bool has_access = resource->write_ranges.Overlaps(offset, offset + size);
     if (check_read_access && !has_access) {
@@ -769,6 +738,13 @@ bool Runtime::IsBufferAccessed(const VideoCore::Buffer* handle, u64 offset, u64 
 
 void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size,
                            vk::PipelineStageFlags2 src_stage, vk::AccessFlags2 src_access) {
+    MakeCurrent(handle);
+
+    const Interval range = {
+        .start = offset,
+        .end = offset + size,
+    };
+
     constexpr static vk::AccessFlags2 READ_MASK =
         vk::AccessFlagBits2::eIndexRead | vk::AccessFlagBits2::eVertexAttributeRead |
         vk::AccessFlagBits2::eUniformRead | vk::AccessFlagBits2::eShaderRead |
@@ -781,38 +757,11 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
         vk::AccessFlagBits2::eDepthStencilAttachmentWrite | vk::AccessFlagBits2::eTransferWrite |
         vk::AccessFlagBits2::eMemoryWrite | vk::AccessFlagBits2::eTransformFeedbackWriteEXT;
 
-    // Only a reported write would look up the reads of the untracked buffer, and none ever is,
-    // so they go unrecorded. The stage still joins the pending barrier.
-    if (handle == untracked_buffer) {
-        ASSERT_MSG(!(src_access & WRITE_MASK), "Write reported for the untracked buffer");
-        ++untracked_skips;
-        memory_barrier.srcStageMask |= src_stage;
-        return;
-    }
-
-    MakeCurrent(handle);
-
-    const Interval range = {
-        .start = offset,
-        .end = offset + size,
-    };
-
-    // A range one recorded interval already covers leaves the list as it is.
-    const auto add = [this, &range](BufferBarriers::AccessList& list) {
-        if (covered_range_skip) {
-            ++barrier_adds;
-            if (list.FindCovering(range.start, range.end) != list.end()) {
-                ++barrier_skips;
-                return;
-            }
-        }
-        list.Add(range);
-    };
     if (src_access & WRITE_MASK) {
-        add(resource->write_ranges);
+        resource->write_ranges.Add(range);
     }
     if (src_access & READ_MASK) {
-        add(resource->read_ranges);
+        resource->read_ranges.Add(range);
     }
 
     memory_barrier.srcStageMask |= src_stage;
@@ -820,6 +769,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    RENDERER_TRACE;
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {
