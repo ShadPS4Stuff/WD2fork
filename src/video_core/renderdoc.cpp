@@ -7,6 +7,7 @@
 #include "video_core/renderdoc.h"
 
 #include <atomic>
+#include <cstdlib>
 #include <renderdoc_app.h>
 
 #ifdef _WIN32
@@ -30,7 +31,24 @@ static std::atomic<u32> screenshot_with_overlays_count{0};
 
 RENDERDOC_API_1_6_0* rdoc_api{};
 
+static void DisableImplicitLayers() {
+    static constexpr const char* DISABLE_VAR = "VK_LOADER_LAYERS_DISABLE";
+    static constexpr const char* ENABLE_VAR = "VK_LOADER_LAYERS_ENABLE";
+    static constexpr const char* RENDERDOC_LAYER = "VK_LAYER_RENDERDOC_Capture";
+#ifdef _WIN32
+    _putenv_s(DISABLE_VAR, "~implicit~");
+    _putenv_s(ENABLE_VAR, RENDERDOC_LAYER);
+#else
+    setenv(DISABLE_VAR, "~implicit~", 1);
+    setenv(ENABLE_VAR, RENDERDOC_LAYER, 1);
+#endif
+    LOG_INFO(Render, "Disabled implicit Vulkan layers except RenderDoc");
+}
+
 void LoadRenderDoc() {
+    if (EmulatorSettings.IsRenderdocEnabled()) {
+        DisableImplicitLayers();
+    }
 #ifdef WIN32
 
     // Check if we are running by RDoc GUI

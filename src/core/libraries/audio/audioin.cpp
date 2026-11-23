@@ -199,11 +199,6 @@ int PS4_SYSV_ABI sceAudioInInput(s32 handle, void* dest) {
         return ORBIS_AUDIO_IN_ERROR_INVALID_HANDLE;
     }
 
-    if (!dest) {
-        LOG_ERROR(Lib_AudioIn, "Invalid output buffer pointer");
-        return ORBIS_AUDIO_IN_ERROR_INVALID_POINTER;
-    }
-
     // Get port with read lock
     std::shared_ptr<PortIn> port;
     {
@@ -218,6 +213,12 @@ int PS4_SYSV_ABI sceAudioInInput(s32 handle, void* dest) {
     if (!port || !port->impl) {
         LOG_ERROR(Lib_AudioIn, "Audio input port {} is not open", handle);
         return ORBIS_AUDIO_IN_ERROR_NOT_OPENED;
+    }
+
+    if (!dest) {
+        // Watch Dogs 2 passes a null buffer while closing voice chat and asserts on an error.
+        LOG_DEBUG(Lib_AudioIn, "null output buffer, nothing copied");
+        return ORBIS_OK;
     }
 
     std::scoped_lock lock{port->mutex};

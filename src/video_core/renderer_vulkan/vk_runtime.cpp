@@ -1,8 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2025 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/alignment.h"
 #include "core/emulator_settings.h"
+#include "common/debug.h"
 #include "video_core/buffer_cache/buffer.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -172,12 +175,31 @@ bool Runtime::Transit(VideoCore::Image* image, vk::ImageLayout dst_layout,
     }
     image->GetBarriers(image_barriers, *image->backing, dst_layout, dst_access, dst_stage,
                        subres_range);
-    return image_barriers.size() != prev_num_barriers;
+    const bool transitioned = image_barriers.size() != prev_num_barriers;
+    for (size_t index = prev_num_barriers; index < image_barriers.size();) {
+        const auto& next = image_barriers[index];
+        const auto pending = std::find_if(
+            image_barriers.begin(), image_barriers.begin() + index, [&](const auto& barrier) {
+                return barrier.image == next.image &&
+                       barrier.subresourceRange == next.subresourceRange;
+            });
+        if (pending == image_barriers.begin() + index) {
+            ++index;
+            continue;
+        }
+        pending->newLayout = next.newLayout;
+        pending->dstStageMask |= next.dstStageMask;
+        pending->dstAccessMask |= next.dstAccessMask;
+        image_barriers.erase(image_barriers.begin() + index);
+    }
+    return transitioned;
 }
 
 void Runtime::UploadImage(VideoCore::Image* dst, const VideoCore::Buffer* src,
                           std::span<const vk::BufferImageCopy> upload_copies) {
-    SetBackingSamples(dst, dst->info.num_samples, false);
+    if (dst->info.num_samples == 1) {
+        SetBackingSamples(dst, 1, false);
+    }
     scheduler.EndRendering();
 
     bool needs_flush =
@@ -242,10 +264,13 @@ void Runtime::CopyImage(VideoCore::Image* src, VideoCore::Image* dst) {
                   vk::to_string(src->info.pixel_format), vk::to_string(dst->info.pixel_format));
     }
 
-    const u32 base_width = src->info.size.width;
-    const u32 base_height = src->info.size.height;
-    const u32 base_depth =
-        dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth : src->info.size.depth;
+    const u32 base_width = std::min(src->info.size.width, dst->info.size.width);
+    const u32 base_height = std::min(src->info.size.height, dst->info.size.height);
+    const bool both_3d = src->info.type == AmdGpu::ImageType::Color3D &&
+                         dst->info.type == AmdGpu::ImageType::Color3D;
+    const u32 base_depth = both_3d ? std::min(src->info.size.depth, dst->info.size.depth)
+                           : dst->info.type == AmdGpu::ImageType::Color3D ? dst->info.size.depth
+                                                                          : src->info.size.depth;
 
     // Match sample count before copying
     SetBackingSamples(dst, dst->info.num_samples, false);
@@ -820,6 +845,7 @@ void Runtime::AccessBuffer(const VideoCore::Buffer* handle, u64 offset, u64 size
 }
 
 void Runtime::FlushBarriers() {
+    RENDERER_TRACE;
     vk::DependencyInfo dep_info{};
 
     if (memory_barrier.srcStageMask) {

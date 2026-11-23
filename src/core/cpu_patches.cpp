@@ -28,6 +28,7 @@
 #include "common/signal_context.h"
 #include "common/types.h"
 #include "common/uint128.h"
+#include "core/emulator_settings.h"
 #include "core/libraries/kernel/time.h"
 #include "core/signals.h"
 #include "core/tls.h"
@@ -3098,7 +3099,9 @@ void PrePatchInstructions(u64 segment_addr, u64 segment_size) {
         TryPatchAot(reinterpret_cast<void*>(segment_addr), segment_size);
     }
 #endif
-    PatchGuestRdtsc(reinterpret_cast<u8*>(segment_addr), segment_size);
+    if (EmulatorSettings.IsGuestRdtscPatch()) {
+        PatchGuestRdtsc(reinterpret_cast<u8*>(segment_addr), segment_size);
+    }
 }
 
 } // namespace Core

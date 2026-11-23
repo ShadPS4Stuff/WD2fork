@@ -3,6 +3,8 @@
 
 #pragma once
 
+#include <string>
+#include <vector>
 #include "common/types.h"
 #include "core/libraries/camera/camera.h"
 
@@ -13,6 +15,40 @@ class SymbolsResolver;
 namespace Libraries::VrTracker {
 
 static constexpr s32 ORBIS_VR_TRACKER_MAX_LED_NUM = 16;
+
+enum PsvrEmuButton : u16 {
+    PsvrEmuButtonSelect = 1 << 0,
+    PsvrEmuButtonT = 1 << 1,
+    PsvrEmuButtonMove = 1 << 2,
+    PsvrEmuButtonStart = 1 << 3,
+    PsvrEmuButtonTriangle = 1 << 4,
+    PsvrEmuButtonCircle = 1 << 5,
+    PsvrEmuButtonCross = 1 << 6,
+    PsvrEmuButtonSquare = 1 << 7,
+};
+
+struct PsvrEmuMoveState {
+    u16 buttons;
+    u16 trigger;
+    bool reach;
+    bool raise;
+};
+
+bool PsvrEmuEnabled();
+PsvrEmuMoveState PsvrEmuGetMove(s32 index);
+
+struct PsvrXrImage {
+    void* image;
+    u32 width;
+    u32 height;
+};
+
+const std::vector<std::string>& PsvrXrVulkanInstanceExtensions();
+const std::vector<std::string>& PsvrXrVulkanDeviceExtensions();
+void PsvrXrSetVulkan(void* instance, void* physical_device, void* device, u32 queue_family,
+                     u32 queue_index);
+bool PsvrXrBeginFrame(u32 width, u32 height, s64 format, PsvrXrImage& out);
+void PsvrXrEndFrame();
 static constexpr u32 ORBIS_VR_TRACKER_MEMORY_ALIGNMENT = 0x10000;
 static constexpr u32 ORBIS_VR_TRACKER_BASE_ONION_SIZE = 0x400000;
 static constexpr u32 ORBIS_VR_TRACKER_GARLIC_SIZE = 0x3000000;

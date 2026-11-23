@@ -102,13 +102,16 @@ void UniqueImage::Destroy() {
     }
 }
 
-void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
+void UniqueImage::Create(const vk::ImageCreateInfo& image_ci, bool require_device_local,
+                         bool dedicated) {
     this->image_ci = image_ci;
     ASSERT(!image);
     VmaAllocationCreateInfo alloc_ci = {
-        .flags = VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT,
+        .flags = (require_device_local ? VmaAllocationCreateFlags{}
+                                       : VMA_ALLOCATION_CREATE_WITHIN_BUDGET_BIT) |
+                 (dedicated ? VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT : 0u),
         .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
-        .requiredFlags = 0,
+        .requiredFlags = require_device_local ? VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT : 0u,
         .preferredFlags = 0,
         .pool = VK_NULL_HANDLE,
         .pUserData = nullptr,
@@ -130,6 +133,9 @@ void UniqueImage::Create(const vk::ImageCreateInfo& image_ci) {
                vk::to_string(vk::Result{result}));
     image = vk::Image{unsafe_image};
     size_bytes = alloc_info.size;
+    VkMemoryPropertyFlags flags{};
+    vmaGetMemoryTypeProperties(allocator, alloc_info.memoryType, &flags);
+    memory_flags = vk::MemoryPropertyFlags{flags};
 }
 
 Image::Image(const Vulkan::Instance& instance, Vulkan::Runtime& runtime_,
@@ -220,7 +226,8 @@ Image::BackingImage& Image::AddBacking(const vk::ImageCreateInfo& create_info, u
     const auto& instance = runtime->GetInstance();
     added_backing.num_samples = num_samples;
     added_backing.image = UniqueImage{instance.GetDevice(), instance.GetAllocator()};
-    added_backing.image.Create(create_info);
+    const bool isolate = info.props.is_depth || num_samples > 1;
+    added_backing.image.Create(create_info, isolate, isolate);
     if (memory_usage_counter) {
         *memory_usage_counter += Common::AlignUp(SizeBytes(), 1024) - previous_size;
     }

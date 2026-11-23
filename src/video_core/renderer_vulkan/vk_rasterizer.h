@@ -4,6 +4,16 @@
 #pragma once
 
 #include "common/assert.h"
+#include <array>
+#include <atomic>
+#include <filesystem>
+#include <map>
+#include <mutex>
+#include <optional>
+#include <set>
+#include <utility>
+#include <vector>
+
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
 #include "core/memory.h"
@@ -32,6 +42,13 @@ class Runtime;
 
 class Rasterizer {
 public:
+    struct ShaderSkipEntry {
+        u64 hash;
+        Shader::SwStage stage;
+        u64 count;
+        bool skipped;
+    };
+
     explicit Rasterizer(const Instance& instance, Scheduler& scheduler, Runtime& runtime,
                         AmdGpu::Liverpool* liverpool);
     ~Rasterizer();
@@ -96,6 +113,7 @@ public:
     void FlushRequested(bool force = false);
     void OnSubmit();
     void OnFence();
+    void OnGpuIdle();
 
     // Scopes a guest-copy hold to one packet run: the caller yields to guest
     // threads between runs and the submit loop sleeps, so the hold must not
@@ -125,6 +143,56 @@ public:
 
     PipelineCache& GetPipelineCache() {
         return pipeline_cache;
+    }
+
+    std::vector<ShaderSkipEntry> GetShaderSkipEntries() const;
+    void SetShaderSkipped(u64 hash, bool skipped);
+    void ClearShaderSkips();
+    static inline std::atomic_bool ignore_float_target_stencil{false};
+    static inline std::atomic_bool ignore_stencil_readers{false};
+
+    enum class PredicationDebugMode : int {
+        Normal,
+        NeverCull,
+        AlwaysCull,
+    };
+
+    struct PredicationDecision {
+        VAddr address;
+        u8 state;
+        bool draw_visible;
+        bool skipped;
+    };
+
+    struct PredicationStats {
+        u64 packets;
+        u64 culled;
+        u64 drawn;
+        u64 unknown;
+        u64 skipped_packets;
+        u64 dumps;
+        u64 inexact_windows;
+        u64 queries;
+        u32 free_slots;
+        bool counting;
+    };
+
+    static inline std::atomic<int> predication_mode{0};
+    static inline std::atomic_bool predication_force_counting{false};
+
+    bool EvaluateZpassPredicate(VAddr address, u32 num_counter_pairs, bool draw_visible);
+    void NotePredicatedPacketSkipped();
+    PredicationStats GetPredicationStats() const;
+    std::vector<PredicationDecision> GetPredicationDecisions() const;
+    void ResetPredicationStats();
+    void ResetZpass();
+    void ToggleZpassCounting();
+    void DumpZpass(VAddr address, u32 num_counter_pairs);
+    std::optional<bool> ReadZpassVisibility(VAddr address, u32 num_counter_pairs) const;
+
+    void StartPassCapture(u32 max_images, u32 min_size, u64 buffer_hash, bool compute_only);
+    u32 PassCaptureRemaining() const {
+        return pass_capture_remaining.load(std::memory_order_relaxed);
     }
 
     template <typename Func>
@@ -159,6 +227,15 @@ private:
 
     bool FilterDraw();
     bool FilterDrawSlow();
+    bool ShouldSkipPipeline(const Pipeline* pipeline);
+    void CapturePassImages(const Pipeline* pipeline);
+    void EnsureSampleCapturePipeline();
+    void CaptureSamples(VideoCore::Image& image, std::filesystem::path path);
+
+    std::optional<u32> BeginZpassQuery(const CommandRecorder& cmdbuf);
+    void EndZpassQuery(const CommandRecorder& cmdbuf, std::optional<u32> slot);
+    void FlushZpassWindow(std::optional<std::pair<VAddr, u32>> dump);
+    void CapturePassBuffers(const Pipeline* pipeline);
 
     void BindBuffers(const Shader::Info& stage, Shader::Backend::Bindings& binding,
                      Shader::PushData& push_data);
@@ -453,6 +530,25 @@ private:
     const bool host_markers_enabled;
     const bool guest_markers_enabled;
     const u32 submit_draw_interval;
+    struct CapturedBuffer {
+        u32 binding;
+        VAddr address;
+        u64 size;
+        const VideoCore::Buffer* buffer;
+        u64 offset;
+    };
+    std::vector<CapturedBuffer> capture_buffers;
+    std::atomic<bool> pass_capture_compute_only{};
+    std::mutex pass_capture_mutex;
+    std::set<std::pair<u64, u64>> pass_capture_seen;
+    std::atomic<u64> pass_capture_buffer_hash{};
+    std::atomic<u32> pass_capture_buffer_remaining{};
+    std::atomic<u32> pass_capture_remaining{};
+    u32 pass_capture_min_size{128};
+    u32 pass_capture_sequence{};
+    std::filesystem::path pass_capture_dir;
+    mutable std::mutex shader_skip_mutex;
+    std::map<u64, ShaderSkipEntry> shader_skip_entries;
     u64 last_submit_tick{};
     u32 draws_since_submit{};
 
@@ -592,6 +688,29 @@ private:
     u64 glue_dyn_miss_{};
     u64 glue_arms_{};
     u64 glue_div_{};
+    static constexpr u32 ZpassPoolSize = 1024;
+    vk::UniqueDescriptorSetLayout sample_capture_set_layout;
+    vk::UniquePipelineLayout sample_capture_layout;
+    vk::UniquePipeline sample_capture_pipeline;
+    vk::UniqueQueryPool zpass_pool;
+    mutable std::mutex zpass_mutex;
+    std::vector<u32> zpass_free_slots;
+    std::vector<u32> zpass_active;
+    u32 zpass_draws{};
+    std::atomic<u64> pred_packets{};
+    std::atomic<u64> pred_culled{};
+    std::atomic<u64> pred_drawn{};
+    std::atomic<u64> pred_unknown{};
+    std::atomic<u64> pred_skipped_packets{};
+    std::atomic<u64> zpass_dumps{};
+    std::atomic<u64> zpass_inexact{};
+    std::atomic<u64> zpass_queries{};
+    mutable std::mutex pred_mutex;
+    std::array<PredicationDecision, 32> pred_decisions{};
+    u32 pred_decision_count{};
+    u64 zpass_counter{};
+    bool zpass_counting{};
+    bool zpass_dump_pending{};
     bool needs_barrier{};
 };
 

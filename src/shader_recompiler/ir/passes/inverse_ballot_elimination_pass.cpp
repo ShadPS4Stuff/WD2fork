@@ -4,6 +4,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/ir_emitter.h"
 #include "shader_recompiler/ir/passes/expression_elimination.h"
 #include "shader_recompiler/ir/program.h"
@@ -167,6 +168,70 @@ void InverseBallotEliminationPass(IR::Program& program) {
             if (user->GetOpcode() == IR::Opcode::InverseBallot) {
                 user->ReplaceUsesWithAndRemove(it->second);
             }
+        }
+    }
+}
+
+namespace {
+
+constexpr u32 ClusterSize = 32;
+constexpr u32 AllXorBits = ClusterSize - 1;
+
+bool MatchButterflyStep(IR::Inst* inst, IR::Value& base, u32& xor_bit) {
+    if (inst->GetOpcode() != IR::Opcode::UMin32) {
+        return false;
+    }
+    for (u32 i = 0; i < 2; ++i) {
+        const IR::Value value{inst->Arg(i)};
+        const IR::Value other{inst->Arg(1 - i)};
+        if (value.IsImmediate() || other.IsImmediate()) {
+            continue;
+        }
+        IR::Inst* const shuffle{value.Inst()};
+        if (shuffle->GetOpcode() != IR::Opcode::ShuffleXor || shuffle->Arg(0) != other ||
+            !shuffle->Arg(1).IsImmediate()) {
+            continue;
+        }
+        const u32 bit{shuffle->Arg(1).U32()};
+        if (bit == 0 || bit > ClusterSize / 2 || (bit & (bit - 1)) != 0) {
+            continue;
+        }
+        base = other;
+        xor_bit = bit;
+        return true;
+    }
+    return false;
+}
+
+} // namespace
+
+void SubgroupReductionPass(IR::Program& program) {
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            IR::Inst* current{&inst};
+            IR::Value base{};
+            u32 seen_bits{};
+            bool matched{true};
+            for (u32 step = 0; step < 5; ++step) {
+                u32 xor_bit{};
+                if (!MatchButterflyStep(current, base, xor_bit) || (seen_bits & xor_bit) != 0) {
+                    matched = false;
+                    break;
+                }
+                seen_bits |= xor_bit;
+                if (step < 4) {
+                    if (base.IsImmediate()) {
+                        matched = false;
+                        break;
+                    }
+                    current = base.Inst();
+                }
+            }
+            if (!matched || seen_bits != AllXorBits) {
+                continue;
+            }
+            IR::IREmitter ir{*block, IR::Block::InstructionList::s_iterator_to(inst)};
+            inst.ReplaceUsesWith(ir.ClusteredUMin(IR::U32{base}, ir.Imm32(ClusterSize)));
         }
     }
 }

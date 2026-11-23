@@ -20,6 +20,7 @@
 #include "common/logging/log.h"
 #include "common/path_util.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/vr_tracker/vr_tracker.h"
 #include "sdl_window.h"
 #include "video_core/gr2_fsr3/dlss_streamline.h"
 #include "video_core/renderer_vulkan/vk_platform.h"
@@ -203,6 +204,13 @@ std::vector<const char*> GetInstanceExtensions(Frontend::WindowSystemType window
 
     if (enable_debug_utils) {
         extensions.push_back(VK_EXT_DEBUG_UTILS_EXTENSION_NAME);
+    }
+
+    for (const auto& extension : Libraries::VrTracker::PsvrXrVulkanInstanceExtensions()) {
+        if (std::none_of(extensions.begin(), extensions.end(),
+                         [&](const char* name) { return extension == name; })) {
+            extensions.push_back(extension.c_str());
+        }
     }
 
     // Sanitize extension list

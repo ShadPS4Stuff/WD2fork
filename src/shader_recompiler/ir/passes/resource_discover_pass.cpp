@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include "common/assert.h"
+#include "common/logging/log.h"
 #include "shader_recompiler/ir/passes/ir_passes.h"
 #include "shader_recompiler/ir/passes/resource_pass.h"
 #include "shader_recompiler/ir/program.h"
@@ -286,7 +287,15 @@ void MarkReadConstBufferSharpSources(const SharpReference& sharp) {
         if (!source) {
             continue;
         }
-        ASSERT(IsSharpSource(source));
+        if (!IsSharpSource(source)) {
+            // Sharp dword is computed by a pattern we don't recognize (e.g. a select or bit
+            // manipulation). Don't abort; the patching pass will mark this sharp as invalid.
+            LOG_WARNING(
+                Render_Recompiler,
+                "Sharp dword {} produced by unsupported opcode {}, sharp fetch may be wrong", i,
+                IR::NameOf(source->GetOpcode()));
+            continue;
+        }
         if (source->GetOpcode() == IR::Opcode::ReadConstBuffer) {
             auto flags = source->Flags<IR::BufferInstInfo>();
             flags.sharp_source.Assign(1u);

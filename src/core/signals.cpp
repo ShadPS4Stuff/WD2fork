@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include <fmt/format.h>
 #include "common/arch.h"
 #include "common/assert.h"
@@ -16,6 +17,7 @@
 #ifdef _WIN32
 #include <windows.h>
 static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
+static constexpr DWORD MS_CPP_EXCEPTION = 0xE06D7363;
 #else
 #include <csignal>
 #include <pthread.h>
@@ -27,6 +29,56 @@ static constexpr DWORD MS_VC_EXCEPTION = 0x406D1388;
 namespace Core {
 
 #if defined(_WIN32)
+
+static std::string DescribeAddress(DWORD64 address) {
+    HMODULE module{};
+    char module_name[MAX_PATH] = "<unknown>";
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                                GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            reinterpret_cast<LPCSTR>(address), &module)) {
+        return fmt::format("{:#x}", address);
+    }
+    GetModuleFileNameA(module, module_name, MAX_PATH);
+    const char* file_name = strrchr(module_name, '\\');
+    return fmt::format("{}+{:#x}", file_name ? file_name + 1 : module_name,
+                       address - reinterpret_cast<DWORD64>(module));
+}
+
+static void LogGuestFrameChain(const CONTEXT* fault_context) {
+    LOG_CRITICAL(Debug, "  guest rbp chain (rbp = {:#x}, rsp = {:#x}):", fault_context->Rbp,
+                 fault_context->Rsp);
+    DWORD64 frame = fault_context->Rbp;
+    for (int depth = 0; depth < 24; ++depth) {
+        if (frame < 0x10000 || (frame & 7) != 0 ||
+            IsBadReadPtr(reinterpret_cast<const void*>(frame), 16)) {
+            break;
+        }
+        const auto* slots = reinterpret_cast<const DWORD64*>(frame);
+        LOG_CRITICAL(Debug, "  guest #{:02} return {:#x}", depth, slots[1]);
+        if (slots[0] <= frame) {
+            break;
+        }
+        frame = slots[0];
+    }
+}
+
+static void LogHostBacktrace(const CONTEXT* fault_context) {
+    CONTEXT context = *fault_context;
+    for (int frame = 0; frame < 24 && context.Rip; ++frame) {
+        LOG_CRITICAL(Debug, "  #{:02} {}", frame, DescribeAddress(context.Rip));
+        DWORD64 image_base{};
+        auto* function = RtlLookupFunctionEntry(context.Rip, &image_base, nullptr);
+        if (!function) {
+            context.Rip = *reinterpret_cast<DWORD64*>(context.Rsp);
+            context.Rsp += sizeof(DWORD64);
+            continue;
+        }
+        PVOID handler_data{};
+        DWORD64 establisher_frame{};
+        RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, context.Rip, function, &context,
+                         &handler_data, &establisher_frame, nullptr);
+    }
+}
 
 static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     using namespace Libraries::Kernel;
@@ -133,6 +185,8 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     case MS_VC_EXCEPTION:
         LOG_DEBUG(Debug, "Pass MS_VC_EXCEPTION at {} to handler", address);
         return EXCEPTION_EXECUTE_HANDLER;
+    case MS_CPP_EXCEPTION:
+        return EXCEPTION_CONTINUE_SEARCH;
     default:
         break;
     }
@@ -151,7 +205,15 @@ static LONG WINAPI SignalHandler(EXCEPTION_POINTERS* pExp) noexcept {
     const bool report_unhandled =
         use_static_windows_guest_red_zone_protection ? static_protection_exception : true;
     if (report_unhandled) {
-        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {}", code, address);
+        LOG_CRITICAL(Debug, "Unhandled Exception code {:#x} at {} ({})", code, address,
+                     DescribeAddress(reinterpret_cast<DWORD64>(address)));
+        if (code == EXCEPTION_ACCESS_VIOLATION && pExp->ExceptionRecord->NumberParameters >= 2) {
+            LOG_CRITICAL(Debug, "  {} of {:#x}",
+                         pExp->ExceptionRecord->ExceptionInformation[0] ? "Write" : "Read",
+                         pExp->ExceptionRecord->ExceptionInformation[1]);
+        }
+        LogGuestFrameChain(pExp->ContextRecord);
+        LogHostBacktrace(pExp->ContextRecord);
         Common::Singleton<Core::Emulator>::Instance()->Shutdown();
     }
 

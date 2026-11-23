@@ -10,6 +10,7 @@
 #include <ranges>
 #include <xxhash.h>
 
+#include "common/debug.h"
 #include "common/hash.h"
 #include "common/io_file.h"
 #include "common/path_util.h"
@@ -587,6 +588,17 @@ constexpr static std::array DescriptorHeapSizes = {
     vk::DescriptorPoolSize{vk::DescriptorType::eSampler, 1024},
 };
 
+static bool IsDualSourceBlending(const AmdGpu::BlendControl& blend) {
+    if (!blend.enable) {
+        return false;
+    }
+    return LiverpoolToVK::IsDualSourceBlendFactor(blend.color_dst_factor) ||
+           LiverpoolToVK::IsDualSourceBlendFactor(blend.color_src_factor) ||
+           (blend.separate_alpha_blend &&
+            (LiverpoolToVK::IsDualSourceBlendFactor(blend.alpha_dst_factor) ||
+             LiverpoolToVK::IsDualSourceBlendFactor(blend.alpha_src_factor)));
+}
+
 static u32 MapOutputs(std::span<Shader::OutputMap, 3> outputs, const AmdGpu::VsOutputControl& ctl) {
     u32 num_outputs = 0;
 
@@ -794,6 +806,10 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(HwStage stage, SwStag
         for (u32 i = 0; i < Shader::MaxColorBuffers; i++) {
             info.hw.fs.color_buffers[i] = graphics_key.color_buffers[i];
         }
+        info.hw.fs.cb_shader_mask =
+            !info.hw.fs.dual_source_blending && regs.color_shader_mask.HasExportHoles()
+                ? regs.color_shader_mask.raw
+                : 0;
         // Lowered user clip planes ride the same emulation path as guest-exported distances, so
         // the fragment side arms whenever the hardware vertex stage lowers them, keeping its input
         // locations in sync with the shifted vertex outputs.
@@ -1727,6 +1743,7 @@ const ComputePipeline* PipelineCache::GetComputePipeline() {
 }
 
 bool PipelineCache::RefreshGraphicsKey() {
+    RENDERER_TRACE;
     std::memset(&graphics_key, 0, sizeof(GraphicsPipelineKey));
     key_is_last = false;
     const auto& regs = liverpool->regs;
@@ -1773,7 +1790,15 @@ bool PipelineCache::RefreshGraphicsKey() {
         color_buffer.data_format = col_buf.GetDataFmt();
         color_buffer.num_format = col_buf.GetNumberFmt();
         color_buffer.num_conversion = col_buf.GetNumberConversion();
-        color_buffer.export_format = regs.color_export_format.GetFormat(cb);
+        const auto& shader_mask = regs.color_shader_mask;
+        if (IsDualSourceBlending(regs.blend_control[0]) || !shader_mask.HasExportHoles()) {
+            color_buffer.export_format = regs.color_export_format.GetFormat(cb);
+        } else if (shader_mask.GetMask(cb) != 0) {
+            color_buffer.export_format =
+                regs.color_export_format.GetFormat(shader_mask.ExportIndex(cb));
+        } else {
+            color_buffer.export_format = AmdGpu::ShaderExportFormat::Zero;
+        }
         color_buffer.swizzle = col_buf.Swizzle();
 
         const auto& bc = regs.blend_control[cb];
@@ -2051,6 +2076,7 @@ bool PipelineCache::RefreshComputeKey() {
 vk::ShaderModule PipelineCache::CompileModule(Shader::Info& info, Shader::RuntimeInfo& runtime_info,
                                               const std::span<const u32>& code, size_t perm_idx,
                                               Shader::Backend::Bindings& binding) {
+    RENDERER_TRACE;
     LOG_INFO(Render_Vulkan, "Compiling {} shader {:#x} {}", info.hw_stage, info.pgm_hash,
              perm_idx != 0 ? "(permutation)" : "");
     DumpShader(code, info.pgm_hash, info.hw_stage, perm_idx, "bin");

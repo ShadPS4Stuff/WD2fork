@@ -430,6 +430,9 @@ void Liverpool::Process(std::stop_token stoken) {
             // for the next draw.
             rasterizer->FlushRequested(true);
         }
+        if (rasterizer) {
+            rasterizer->OnGpuIdle();
+        }
 
         Platform::IrqC::Instance()->Signal(Platform::InterruptId::GpuIdle);
     }
@@ -741,6 +744,13 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
 
         const u32 count = header->type3.NumWords();
         const PM4ItOpcode opcode = header->type3.opcode;
+        if (predicate_skip && header->type3.predicate == PM4Predicate::PredEnable) {
+            if (rasterizer) {
+                rasterizer->NotePredicatedPacketSkipped();
+            }
+            dcb = NextPacket(dcb, count + 1);
+            continue;
+        }
         // The header load-use stall dominates this loop, so two lines in
         // flight cover the next headers and payload.
         __builtin_prefetch(dcb.data() + 64, 0, 3);
@@ -846,7 +856,18 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
         }
         case PM4ItOpcode::SetPredication: {
             ++packet_stats.set_predication;
-            LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+            const auto* set_pred = reinterpret_cast<const PM4CmdSetPredication*>(header);
+            const bool combine = set_pred->continue_predication.Value() != 0;
+            bool skip = false;
+            if (set_pred->pred_op.Value() == PredicationOp::Zpass && rasterizer) {
+                skip = rasterizer->EvaluateZpassPredicate(set_pred->Address(), num_counter_pairs,
+                                                          set_pred->draw_visible.Value() != 0);
+            }
+            if (set_pred->pred_op.Value() == PredicationOp::Clear) {
+                predicate_skip = false;
+            } else {
+                predicate_skip = skip || (combine && predicate_skip);
+            }
             break;
         }
         case PM4ItOpcode::IndexType: {
@@ -1078,9 +1099,20 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
                 // TODO: handle proper synchronization, for now signal that update is done
                 // immediately
                 regs.cp_strmout_cntl.offset_update_done = 1;
-            } else if (event->event_index.Value() == EventIndex::ZpassDone) {
-                if (event->event_type.Value() == EventType::PixelPipeStatDump) {
-                    ++packet_stats.occlusion_events;
+            } else if (event->event_type.Value() == EventType::PixelPipeStatReset) {
+                if (rasterizer) {
+                    rasterizer->ResetZpass();
+                }
+            } else if (event->event_type.Value() == EventType::PixelPipeStatControl) {
+                if (rasterizer) {
+                    rasterizer->ToggleZpassCounting();
+                }
+            } else if (event->event_index.Value() == EventIndex::ZpassDone &&
+                       event->event_type.Value() == EventType::PixelPipeStatDump) {
+                ++packet_stats.occlusion_events;
+                if (rasterizer) {
+                    rasterizer->DumpZpass(event->Address<VAddr>(), num_counter_pairs);
+                } else {
                     static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                     static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                     u64* results = event->Address<u64*>();
@@ -1269,8 +1301,28 @@ std::span<const u32> Liverpool::RunGraphicsPackets(std::span<const u32> dcb, uin
     return dcb;
 }
 
+void Liverpool::LogQueueState() {
+    LOG_WARNING(Render, "GPU state: submits={} commands={} submit_done={}", num_submits.load(),
+                num_commands.load(), submit_done.load());
+    for (u32 slot = 0; slot < queue_waits.size(); ++slot) {
+        const auto& wait = queue_waits[slot];
+        if (!wait.kind) {
+            continue;
+        }
+        const bool is_reg = std::string_view{wait.kind} == "WaitRegMemReg";
+        const u32 current =
+            is_reg ? regs.reg_array[wait.address] : *reinterpret_cast<const u32*>(wait.address);
+        LOG_WARNING(Render,
+                    "  queue {} blocked on {} addr={:#x} current={:#x} func={} ref={:#x} "
+                    "mask={:#x}",
+                    slot == 0 ? std::string{"gfx"} : fmt::format("asc{}", slot - 1), wait.kind,
+                    wait.address, current, wait.function, wait.reference, wait.mask);
+    }
+}
+
 Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
     FIBER_ENTER(dcb_task_name);
+    predicate_skip = false;
 
     auto base_addr = reinterpret_cast<uintptr_t>(dcb.data());
     while (true) {
@@ -1289,9 +1341,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                queue_waits[0] = {"MemSemaphore", mem_semaphore->Address<u64>(), 0, 0, 0};
                 while (!mem_semaphore->Signaled()) {
                     YIELD_GFX();
                 }
+                queue_waits[0] = {};
                 mem_semaphore->Decrement();
             }
             break;
@@ -1301,9 +1355,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 break;
             }
             const PM4CmdRewind* rewind = reinterpret_cast<const PM4CmdRewind*>(header);
+            queue_waits[0] = {"Rewind", reinterpret_cast<u64>(rewind), 0, 0, 0};
             while (!rewind->Valid()) {
                 YIELD_GFX();
             }
+            queue_waits[0] = {};
             break;
         }
         case PM4ItOpcode::WaitRegMem: {
@@ -1319,9 +1375,18 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb) {
                 vo_port->WaitVoLabel([&] { return wait_reg_mem->Test(regs.reg_array); });
                 break;
             }
+            queue_waits[0] = {wait_reg_mem->mem_space == PM4CmdWaitRegMem::MemSpace::Memory
+                                  ? "WaitRegMem"
+                                  : "WaitRegMemReg",
+                              wait_reg_mem->mem_space == PM4CmdWaitRegMem::MemSpace::Memory
+                                  ? wait_reg_mem->Address<u64>()
+                                  : u64{wait_reg_mem->Reg()},
+                              static_cast<u32>(wait_reg_mem->function.Value()),
+                              wait_reg_mem->ref, wait_reg_mem->mask};
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_GFX();
             }
+            queue_waits[0] = {};
             break;
         }
         case PM4ItOpcode::IndirectBuffer: {
@@ -1597,9 +1662,11 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             if (mem_semaphore->IsSignaling()) {
                 mem_semaphore->Signal();
             } else {
+                queue_waits[vqid + 1] = {"MemSemaphore", mem_semaphore->Address<u64>(), 0, 0, 0};
                 while (!mem_semaphore->Signaled()) {
                     YIELD_ASC(vqid);
                 }
+                queue_waits[vqid + 1] = {};
                 mem_semaphore->Decrement();
             }
             break;
@@ -1607,9 +1674,18 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
         case PM4ItOpcode::WaitRegMem: {
             const auto* wait_reg_mem = reinterpret_cast<const PM4CmdWaitRegMem*>(header);
             ASSERT(wait_reg_mem->engine.Value() == PM4CmdWaitRegMem::Engine::Me);
+            queue_waits[vqid + 1] = {wait_reg_mem->mem_space == PM4CmdWaitRegMem::MemSpace::Memory
+                                         ? "WaitRegMem"
+                                         : "WaitRegMemReg",
+                                     wait_reg_mem->mem_space == PM4CmdWaitRegMem::MemSpace::Memory
+                                         ? wait_reg_mem->Address<u64>()
+                                         : u64{wait_reg_mem->Reg()},
+                                     static_cast<u32>(wait_reg_mem->function.Value()),
+                                     wait_reg_mem->ref, wait_reg_mem->mask};
             while (!wait_reg_mem->Test(regs.reg_array)) {
                 YIELD_ASC(vqid);
             }
+            queue_waits[vqid + 1] = {};
             break;
         }
         case PM4ItOpcode::ReleaseMem: {

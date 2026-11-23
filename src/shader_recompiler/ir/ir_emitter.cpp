@@ -710,6 +710,10 @@ U32 IREmitter::ShuffleXor(const U32& value, const U32& mask) {
     return Inst<U32>(Opcode::ShuffleXor, value, mask);
 }
 
+U32 IREmitter::ClusteredUMin(const U32& value, const U32& cluster_size) {
+    return Inst<U32>(Opcode::ClusteredUMin, value, cluster_size);
+}
+
 U32 IREmitter::ReadFirstLane(const U32& value) {
     return Inst<U32>(Opcode::ReadFirstLane, value);
 }

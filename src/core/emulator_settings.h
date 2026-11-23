@@ -44,6 +44,7 @@ enum GpuReadbacksMode : int {
     Disabled,
     Relaxed,
     Precise,
+    PreciseOptimized,
 };
 
 enum class ConfigMode {
@@ -209,6 +210,7 @@ struct GeneralSettings {
     Setting<int> big_picture_scale{1000};
     Setting<int> big_picture_folder_depth{2};
     Setting<bool> redzone_patches{false};
+    Setting<bool> guest_rdtsc_patch{true}; // specific
     // return a vector of override descriptors (runtime, but tiny)
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -227,7 +229,9 @@ struct GeneralSettings {
             make_override<GeneralSettings>("trophy_notification_side",
                                            &GeneralSettings::trophy_notification_side),
             make_override<GeneralSettings>("console_language", &GeneralSettings::console_language),
-            make_override<GeneralSettings>("redzone_patches", &GeneralSettings::redzone_patches)};
+            make_override<GeneralSettings>("redzone_patches", &GeneralSettings::redzone_patches),
+            make_override<GeneralSettings>("guest_rdtsc_patch",
+                                           &GeneralSettings::guest_rdtsc_patch)};
     }
 };
 
@@ -237,7 +241,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(GeneralSettings, install_dirs, addon_install_
                                    trophy_popup_disabled, trophy_notification_duration, show_splash,
                                    trophy_notification_side, discord_rpc_enabled, show_fps_counter,
                                    console_language, big_picture_scale, big_picture_folder_depth,
-                                   redzone_patches)
+                                   redzone_patches, guest_rdtsc_patch)
 
 // -------------------------------
 // Network settings
@@ -360,6 +364,9 @@ struct InputSettings {
     Setting<bool> use_mice_as_mice{false};
     Setting<bool> use_keyboard_as_keyboard{false};
     Setting<bool> vibration_enabled{true}; // specific
+    // Fakes a connected PSVR headset, tracker and two Move controllers driven by the keyboard.
+    Setting<bool> psvr_emu_test{false}; // specific
+    Setting<bool> psvr_openxr{false};   // specific
 
     std::vector<OverrideItem> GetOverrideableFields() const {
         return std::vector<OverrideItem>{
@@ -384,7 +391,9 @@ struct InputSettings {
             make_override<InputSettings>("use_mice_as_mice", &InputSettings::use_mice_as_mice),
             make_override<InputSettings>("use_keyboard_as_keyboard",
                                          &InputSettings::use_keyboard_as_keyboard),
-            make_override<InputSettings>("vibration_enabled", &InputSettings::vibration_enabled)};
+            make_override<InputSettings>("vibration_enabled", &InputSettings::vibration_enabled),
+            make_override<InputSettings>("psvr_emu_test", &InputSettings::psvr_emu_test),
+            make_override<InputSettings>("psvr_openxr", &InputSettings::psvr_openxr)};
     }
 };
 NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_timeout,
@@ -394,7 +403,7 @@ NLOHMANN_DEFINE_TYPE_NON_INTRUSIVE(InputSettings, cursor_state, cursor_hide_time
                                    default_controller_id, background_controller_input,
                                    ime_accessibility_enabled, ime_url_mail_short_panel, camera_id,
                                    is_circle_enter, use_mice_as_mice, use_keyboard_as_keyboard,
-                                   vibration_enabled)
+                                   vibration_enabled, psvr_emu_test, psvr_openxr)
 // -------------------------------
 // Audio settings
 // -------------------------------
@@ -450,6 +459,7 @@ struct GPUSettings {
     // Nothing is protected or tracked and any readbacks_mode works. Suits values a game reads
     // every frame, like exposure and lighting, not one-off reads.
     Setting<bool> readback_linear_images_async{true};
+    Setting<bool> force_60hz_flip_rate{false}; // specific
     Setting<u32> adaptive_skipcaches_mode{AdaptiveSkipCachesMode::SkipCachesForced};
     // Image touches only stamp the per-image gc tick; the LRU list is relinked when the garbage
     // collector walk meets an entry touched since its list tick, so a hot image is relinked once
@@ -753,6 +763,8 @@ struct GPUSettings {
                                        &GPUSettings::readback_linear_images_enabled),
             make_override<GPUSettings>("readback_linear_images_async",
                                        &GPUSettings::readback_linear_images_async),
+            make_override<GPUSettings>("force_60hz_flip_rate",
+                                       &GPUSettings::force_60hz_flip_rate),
             GPU_OVERRIDE(adaptive_skipcaches_mode),
             GPU_OVERRIDE(texture_lru_lazy_touch),
             GPU_OVERRIDE(gather_input_memo),
@@ -859,7 +871,7 @@ struct GPUSettings {
     draw_glue_memo, image_fast_state, guest_copy_lock_batch, spec_fp_cache, \
     runtime_info_stamp_gate, userfaultfd, \
     vertex_layout_memo, covered_range_skip, residency_bitmap, \
-    readback_linear_images_async, inline_fetch_shader, stream_barrier_skip, \
+    readback_linear_images_async, force_60hz_flip_rate, inline_fetch_shader, stream_barrier_skip, \
     clean_sync_peek, readback_offload, fast_shader_math, one_core_gpu_thread_pin, \
     vk_record_thread, async_shader_recompiling, pipeline_sync_budget_ms, submit_draw_interval
 // clang-format on
@@ -1151,6 +1163,7 @@ public:
     SETTING_FORWARD(m_general, BigPictureScale, big_picture_scale)
     SETTING_FORWARD(m_general, BigPictureFolderDepth, big_picture_folder_depth)
     SETTING_FORWARD_BOOL(m_general, RedZonePatchingEnabled, redzone_patches)
+    SETTING_FORWARD_BOOL(m_general, GuestRdtscPatch, guest_rdtsc_patch)
 
     // Network settings
     SETTING_FORWARD_BOOL(m_network, ConnectedToNetwork, connected_to_network)
@@ -1287,6 +1300,7 @@ public:
     SETTING_FORWARD(m_gpu, ReadbacksMode, readbacks_mode)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesEnabled, readback_linear_images_enabled)
     SETTING_FORWARD_BOOL(m_gpu, ReadbackLinearImagesAsync, readback_linear_images_async)
+    SETTING_FORWARD_BOOL(m_gpu, Force60HzFlipRate, force_60hz_flip_rate)
     SETTING_FORWARD_BOOL(m_gpu, DirectMemoryAccessEnabled, direct_memory_access_enabled)
     SETTING_FORWARD_BOOL_READONLY(m_gpu, PatchShaders, patch_shaders)
     SETTING_FORWARD_BOOL(m_gpu, UserfaultfdTracking, userfaultfd)
@@ -1330,6 +1344,8 @@ public:
     SETTING_FORWARD_BOOL(m_input, MiceUsedAsMice, use_mice_as_mice)
     SETTING_FORWARD_BOOL(m_input, KeyboardUsedAsKeyboard, use_keyboard_as_keyboard)
     SETTING_FORWARD_BOOL(m_input, VibrationEnabled, vibration_enabled)
+    SETTING_FORWARD_BOOL(m_input, PsvrEmuTest, psvr_emu_test)
+    SETTING_FORWARD_BOOL(m_input, PsvrOpenXr, psvr_openxr)
 
     // Vulkan settings
     SETTING_FORWARD(m_vulkan, GpuId, gpu_id)

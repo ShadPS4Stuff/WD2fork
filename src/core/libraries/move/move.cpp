@@ -1,16 +1,42 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <cstring>
 #include "common/logging/log.h"
 #include "core/libraries/error_codes.h"
 #include "core/libraries/libs.h"
 #include "core/libraries/move/move.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/move/move_error.h"
+#include "core/libraries/vr_tracker/vr_tracker.h"
 #include "move.h"
 
 namespace Libraries::Move {
 
 static bool g_library_initialized = false;
+static s32 g_handles[2]{-1, -1};
+
+static s32 EmulatedIndex(s32 handle) {
+    if (!VrTracker::PsvrEmuEnabled()) {
+        return -1;
+    }
+    for (s32 i = 0; i < 2; i++) {
+        if (g_handles[i] == handle) {
+            return i;
+        }
+    }
+    return -1;
+}
+
+static void FillEmulatedData(s32 index, OrbisMoveData* data) {
+    const auto state = VrTracker::PsvrEmuGetMove(index);
+    std::memset(data, 0, sizeof(*data));
+    data->accelerometer[1] = 1.0f;
+    data->button_data.button_data = state.buttons;
+    data->button_data.trigger_data = state.trigger;
+    data->timestamp = static_cast<s64>(Libraries::Kernel::sceKernelGetProcessTime());
+    data->temperature = 30.0f;
+}
 
 s32 PS4_SYSV_ABI sceMoveInit() {
     if (g_library_initialized) {
@@ -30,7 +56,11 @@ s32 PS4_SYSV_ABI sceMoveOpen(Libraries::UserService::OrbisUserServiceUserId user
     // Even when no controllers are connected, this returns a proper handle.
     // Internal libSceVrTracker logic requires this handle to be different from other devices.
     static s32 handle = 0x30b0000;
-    return handle += 0x100;
+    handle += 0x100;
+    if (index >= 0 && index < 2) {
+        g_handles[index] = handle;
+    }
+    return handle;
 }
 
 s32 PS4_SYSV_ABI sceMoveGetDeviceInfo(s32 handle, OrbisMoveDeviceInfo* info) {
@@ -40,6 +70,13 @@ s32 PS4_SYSV_ABI sceMoveGetDeviceInfo(s32 handle, OrbisMoveDeviceInfo* info) {
     }
     if (info == nullptr) {
         return ORBIS_MOVE_ERROR_INVALID_ARG;
+    }
+    if (EmulatedIndex(handle) >= 0) {
+        info->sphere_radius = 0.0225f;
+        info->accelerometer_offset[0] = 0.0f;
+        info->accelerometer_offset[1] = 0.0f;
+        info->accelerometer_offset[2] = 0.0f;
+        return ORBIS_OK;
     }
     return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
 }
@@ -52,6 +89,10 @@ s32 PS4_SYSV_ABI sceMoveReadStateLatest(s32 handle, OrbisMoveData* data) {
     if (data == nullptr) {
         return ORBIS_MOVE_ERROR_INVALID_ARG;
     }
+    if (const s32 index = EmulatedIndex(handle); index >= 0) {
+        FillEmulatedData(index, data);
+        return ORBIS_OK;
+    }
     return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
 }
 
@@ -63,6 +104,11 @@ s32 PS4_SYSV_ABI sceMoveReadStateRecent(s32 handle, s64 timestamp, OrbisMoveData
     }
     if (timestamp < 0 || data == nullptr || out_count == nullptr) {
         return ORBIS_MOVE_ERROR_INVALID_ARG;
+    }
+    if (const s32 index = EmulatedIndex(handle); index >= 0) {
+        FillEmulatedData(index, data);
+        *out_count = 1;
+        return ORBIS_OK;
     }
     return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
 }
@@ -83,6 +129,9 @@ s32 PS4_SYSV_ABI sceMoveSetVibration(s32 handle, u8 intensity) {
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
     }
+    if (EmulatedIndex(handle) >= 0) {
+        return ORBIS_OK;
+    }
     return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
 }
 
@@ -90,6 +139,9 @@ s32 PS4_SYSV_ABI sceMoveSetLightSphere(s32 handle, u8 red, u8 green, u8 blue) {
     LOG_TRACE(Lib_Move, "called");
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
+    }
+    if (EmulatedIndex(handle) >= 0) {
+        return ORBIS_OK;
     }
     return ORBIS_MOVE_ERROR_NO_CONTROLLER_CONNECTED;
 }
@@ -107,6 +159,11 @@ s32 PS4_SYSV_ABI sceMoveClose(s32 handle) {
     LOG_DEBUG(Lib_Move, "called");
     if (!g_library_initialized) {
         return ORBIS_MOVE_ERROR_NOT_INIT;
+    }
+    for (auto& open_handle : g_handles) {
+        if (open_handle == handle) {
+            open_handle = -1;
+        }
     }
     return ORBIS_OK;
 }

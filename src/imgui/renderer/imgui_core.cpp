@@ -5,11 +5,14 @@
 #include <atomic>
 #include <bit>
 #include <cstdint>
+#include <cstring>
 #include <SDL3/SDL_events.h>
 #include <imgui.h>
 
 #include "common/path_util.h"
+#include "common/singleton.h"
 #include "core/debug_state.h"
+#include "core/linker.h"
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "font_data.h"
@@ -37,6 +40,78 @@ static std::mutex change_layers_mutex{};
 
 static ImGuiID dock_id;
 static std::atomic<std::uint32_t> force_gamepad_input_capture_count{0};
+
+struct GuestOverlay {
+    u32 magic;
+    u32 visible;
+    u32 width;
+    u32 height;
+    u32 x;
+    u32 y;
+    u32 serial;
+    u32 reserved;
+    const u8* pixels;
+};
+
+static constexpr u32 GuestOverlayMagic = 0x564F4853;
+static constexpr u32 GuestOverlayMaxSize = 2048;
+
+static void DrawGuestOverlay() {
+    static GuestOverlay* overlay{};
+    static u32 search_frames{};
+    static u32 last_serial{};
+    static ImTextureData texture{};
+
+    if (!overlay) {
+        if (search_frames++ % 120 != 0) {
+            return;
+        }
+        const auto* linker = Common::Singleton<Core::Linker>::Instance();
+        for (s32 i = 0; auto* module = linker->GetModule(i); ++i) {
+            if (auto* found = static_cast<GuestOverlay*>(module->FindByName("wd2_shad_overlay"))) {
+                overlay = found;
+                break;
+            }
+        }
+        if (!overlay) {
+            return;
+        }
+    }
+    if (overlay->magic != GuestOverlayMagic || !overlay->visible || !overlay->pixels ||
+        overlay->width == 0 || overlay->height == 0 || overlay->width > GuestOverlayMaxSize ||
+        overlay->height > GuestOverlayMaxSize) {
+        return;
+    }
+
+    const int width = static_cast<int>(overlay->width);
+    const int height = static_cast<int>(overlay->height);
+    if (texture.Width != width || texture.Height != height) {
+        if (texture.Pixels) {
+            ImGui::UnregisterUserTexture(&texture);
+            texture.DestroyPixels();
+        }
+        texture.Create(ImTextureFormat_RGBA32, width, height);
+        ImGui::RegisterUserTexture(&texture);
+        last_serial = ~overlay->serial;
+    }
+    if (overlay->serial != last_serial) {
+        last_serial = overlay->serial;
+        std::memcpy(texture.Pixels, overlay->pixels, texture.GetSizeInBytes());
+        if (texture.Status == ImTextureStatus_OK) {
+            const ImTextureRect rect{0, 0, static_cast<unsigned short>(width),
+                                     static_cast<unsigned short>(height)};
+            texture.Updates.push_back(rect);
+            texture.UpdateRect = rect;
+            texture.SetStatus(ImTextureStatus_WantUpdates);
+        }
+    }
+
+    const ImVec2 display = ImGui::GetIO().DisplaySize;
+    const float scale = display.y / 1080.0f;
+    const ImVec2 min{overlay->x * scale, overlay->y * scale};
+    const ImVec2 max{min.x + width * scale, min.y + height * scale};
+    ImGui::GetForegroundDrawList()->AddImage(texture.GetTexRef(), min, max);
+}
 
 namespace ImGui {
 
@@ -249,6 +324,7 @@ ImGuiID NewFrame(bool is_reusing_frame) {
     for (auto* layer : layers) {
         layer->Draw();
     }
+    DrawGuestOverlay();
 
     return dockId;
 }

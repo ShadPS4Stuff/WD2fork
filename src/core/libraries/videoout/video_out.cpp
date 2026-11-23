@@ -1,6 +1,7 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
 #include <fmt/format.h>
 #include "common/assert.h"
 #include "common/elf_info.h"
@@ -11,6 +12,7 @@
 #include "core/libraries/videoout/driver.h"
 #include "core/libraries/videoout/video_out.h"
 #include "core/libraries/videoout/videoout_error.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 #include "core/platform.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
 
@@ -141,7 +143,7 @@ s32 PS4_SYSV_ABI sceVideoOutRegisterBuffers(s32 handle, s32 startIndex, void* co
 
 s32 PS4_SYSV_ABI sceVideoOutSetFlipRate(s32 handle, s32 rate) {
     LOG_TRACE(Lib_VideoOut, "called");
-    driver->GetPort(handle)->flip_rate = rate;
+    driver->GetPort(handle)->flip_rate = EmulatorSettings.IsForce60HzFlipRate() ? 0 : rate;
     return ORBIS_OK;
 }
 
@@ -151,6 +153,46 @@ s32 PS4_SYSV_ABI sceVideoOutIsFlipPending(s32 handle) {
     std::unique_lock lock{port->port_mutex};
     s32 pending = port->flip_status.flip_pending_num;
     return pending;
+}
+
+namespace {
+std::mutex g_psvr_eye_mutex;
+VAddr g_psvr_eye_address = 0;
+u32 g_psvr_eye_width = 0;
+u32 g_psvr_eye_height = 0;
+u32 g_psvr_eye_pitch = 0;
+} // namespace
+
+void SetPsvrEyeTarget(VAddr address, u32 width, u32 height, u32 pitch) {
+    std::scoped_lock lk{g_psvr_eye_mutex};
+    g_psvr_eye_address = address;
+    g_psvr_eye_width = width;
+    g_psvr_eye_height = height;
+    g_psvr_eye_pitch = pitch;
+}
+
+bool SubmitPsvrEyeFlip(s32 handle) {
+    auto* port = driver->GetPort(handle);
+    if (!port) {
+        return false;
+    }
+    BufferAttributeGroup group{};
+    VAddr address;
+    {
+        std::scoped_lock lk{g_psvr_eye_mutex};
+        if (g_psvr_eye_address == 0) {
+            return false;
+        }
+        address = g_psvr_eye_address;
+        group.is_occupied = true;
+        group.attrib.pixel_format = PixelFormat::A8B8G8R8Srgb;
+        group.attrib.tiling_mode = TilingMode::Tile;
+        group.attrib.width = g_psvr_eye_width;
+        group.attrib.height = g_psvr_eye_height;
+        group.attrib.pitch_in_pixel = g_psvr_eye_pitch;
+        group.attrib.option = Vulkan::PsvrEyeFlipOption;
+    }
+    return driver->SubmitImageFlip(port, group, address);
 }
 
 s32 PS4_SYSV_ABI sceVideoOutSubmitFlip(s32 handle, s32 bufferIndex, s32 flipMode, s64 flipArg) {

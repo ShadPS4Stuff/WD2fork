@@ -91,6 +91,7 @@ public:
                               const BufferAttribute* attribute);
 
     bool SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop = false);
+    bool SubmitImageFlip(VideoOutPort* port, const BufferAttributeGroup& group, VAddr address);
 
 private:
     struct Request {

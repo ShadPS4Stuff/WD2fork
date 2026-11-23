@@ -315,6 +315,30 @@ bool VideoOutDriver::SubmitFlip(VideoOutPort* port, s32 index, s64 flip_arg,
     return true;
 }
 
+bool VideoOutDriver::SubmitImageFlip(VideoOutPort* port, const BufferAttributeGroup& group,
+                                     VAddr address) {
+    {
+        std::unique_lock lock{port->port_mutex};
+        if (port->flip_status.flip_pending_num > 16) {
+            return false;
+        }
+        ++port->flip_status.flip_pending_num;
+        port->flip_status.submit_tsc = Libraries::Kernel::sceKernelReadTsc();
+    }
+    liverpool->SendCommand([=, this]() {
+        Vulkan::Frame* frame = presenter->PrepareFrame(group, address);
+        std::scoped_lock lock{mutex};
+        requests.push({
+            .frame = frame,
+            .port = port,
+            .flip_arg = 0,
+            .index = port->prev_index,
+            .eop = false,
+        });
+    });
+    return true;
+}
+
 void VideoOutDriver::SubmitFlipInternal(VideoOutPort* port, s32 index, s64 flip_arg, bool is_eop) {
     Vulkan::Frame* frame;
     if (index == -1) {

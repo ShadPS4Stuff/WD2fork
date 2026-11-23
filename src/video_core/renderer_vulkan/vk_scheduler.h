@@ -492,6 +492,9 @@ public:
 
     /// Resets the current command buffer; follows a Finish at shutdown.
     void ResetCommandBuffer();
+    static std::mutex& SubmitMutex() {
+        return submit_mutex;
+    }
 
     /// Attempts to execute operations whose tick the GPU has caught up with.
     void PopPendingOperations();

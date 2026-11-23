@@ -8,6 +8,7 @@
 #include <mutex>
 #include <optional>
 #include <vector>
+#include <span>
 #include <boost/container/small_vector.hpp>
 
 #include "common/enum.h"
@@ -18,6 +19,7 @@
 #include "video_core/buffer_cache/range_set.h"
 #include "video_core/renderer_vulkan/vk_semaphore.h"
 #include "video_core/texture_cache/image.h"
+#include "video_core/texture_cache/types.h"
 
 namespace AmdGpu {
 struct Liverpool;
@@ -52,6 +54,16 @@ enum class ObtainBufferFlags {
 DECLARE_ENUM_FLAG_OPERATORS(ObtainBufferFlags)
 
 class BufferCache {
+public:
+    static inline std::atomic<u64> readback_requests{0};
+    static inline std::atomic<u64> readback_stalls{0};
+    static inline std::atomic<u64> readback_async{0};
+    static inline std::atomic<u64> readback_bytes{0};
+    static inline std::atomic<u32> readback_window_kb{512};
+    static inline std::atomic<u32> readback_live_mode{0};
+    static inline std::atomic<u64> readback_fast{0};
+
+private:
     static constexpr u64 ADDRESS_SPACE_BITS = 40;
     static constexpr u64 ARENA_PAGE_BITS = 32;
     static constexpr u64 ARENA_PAGE_SIZE = u64{1} << ARENA_PAGE_BITS;
@@ -190,6 +202,13 @@ public:
     OffloadStats DrainOffloadStats();
 
 private:
+    void NotePendingWrite(VAddr addr, u64 size);
+    bool CanReadBackEarly(VAddr addr, u64 size) const;
+    void CopyForReadback(const Buffer* arena, const Buffer* staging,
+                         std::span<const vk::BufferCopy> copies);
+
+public:
+private:
     struct ArenaBinds {
         const Buffer* arena;
         boost::container::small_vector<vk::SparseMemoryBind, 32> binds;
@@ -240,9 +259,10 @@ private:
     const Buffer* ArenaOf(VAddr device_addr, u64& bind_tick);
 
     bool SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size, bool is_written,
-                           bool is_texel_buffer);
+                           bool is_texel_buffer, std::span<const ImageId> image_ids = {});
 
-    bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size);
+    bool SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size,
+                                    std::span<const ImageId> image_ids = {});
 
     /// Streams a read-only range through the copy lane. Returns the stream buffer offset, or
     /// nullopt when the range must be copied inline.
@@ -273,6 +293,11 @@ private:
     std::deque<Buffer> arenas;
     std::vector<ArenaBinds> pending_binds;
     Vulkan::Semaphore memory_semaphore;
+    RangeSet pending_writes;
+    u64 pending_writes_tick{};
+    vk::UniqueCommandPool readback_pool;
+    vk::UniqueCommandBuffer readback_cmdbuf;
+    vk::UniqueFence readback_fence;
 
     struct Backing : public Interval {
         vk::DeviceMemory memory;

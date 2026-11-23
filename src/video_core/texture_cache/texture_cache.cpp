@@ -195,6 +195,27 @@ void TextureCache::ProcessDownloadImages() {
     scheduler.DrainPendingOperations();
 }
 
+namespace {
+void WriteBackPitchedRows(VAddr address, const u8* data, u64 size, u32 pitch, u32 width,
+                          u32 rows, u32 bytes_per_pixel) {
+    const u64 row_stride = u64{pitch} * bytes_per_pixel;
+    const u64 row_bytes = u64{std::min(width, pitch)} * bytes_per_pixel;
+    if (rows == 0 || row_stride == 0 || row_stride * (rows - 1) + row_bytes > size) {
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(address), data, size);
+        return;
+    }
+    if (row_stride == row_bytes) {
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(address), data,
+                                                  row_stride * rows);
+        return;
+    }
+    for (u32 row = 0; row < rows; ++row) {
+        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(address + row * row_stride),
+                                                  data + row * row_stride, row_bytes);
+    }
+}
+} // namespace
+
 void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags flags) {
     Image& image = slot_images[image_id];
     if (False(image.flags & ImageFlagBits::GpuModified)) {
@@ -242,10 +263,22 @@ void TextureCache::DownloadImageMemory(ImageId image_id, DownloadMemoryFlags fla
 
     tile_manager.TileImage(image, buffer_copies, download.buffer, download.offset);
 
-    const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync] {
+    const bool pitched_rows = image_mips == 1 && image.info.size.depth == 1 &&
+                              image.info.resources.layers == 1 && !image.info.props.is_tiled;
+    const u32 row_pitch = image.info.pitch;
+    const u32 row_width = image.info.size.width;
+    const u32 row_count = image.info.size.height;
+    const u32 bytes_per_pixel = image.info.num_bits / 8;
+    const auto write_data = [this, image_addr, copy_size, download, discard_buffer_cache, is_sync,
+                             pitched_rows, row_pitch, row_width, row_count, bytes_per_pixel] {
         download.Invalidate();
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr), download.mapped,
-                                                  copy_size);
+        if (pitched_rows) {
+            WriteBackPitchedRows(image_addr, download.mapped, copy_size, row_pitch, row_width,
+                                 row_count, bytes_per_pixel);
+        } else {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(image_addr),
+                                                      download.mapped, copy_size);
+        }
         Skipcache::Framework::Instance().BumpMemGen();
         if (discard_buffer_cache) {
             buffer_cache.UnmarkRegionAsGpuModified(image_addr, copy_size, true);
@@ -317,12 +350,23 @@ bool TextureCache::DownloadImageMemoryAsync(ImageId image_id) {
         .imageExtent = {image.info.size.width, image.info.size.height, image.info.size.depth},
     };
     runtime.DownloadImage(&image, staging.get(), std::span{&image_download, 1});
+    const bool pitched_rows = image.info.size.depth == 1 && image.info.resources.layers == 1 &&
+                              !image.info.props.is_tiled;
     scheduler.DeferPriorityOperation([this, staging = std::move(staging),
-                                      device_addr = image.info.guest_address,
-                                      download_size]() mutable {
+                                      device_addr = image.info.guest_address, download_size,
+                                      pitched_rows, row_pitch = image.info.pitch,
+                                      row_width = image.info.size.width,
+                                      row_count = image.info.size.height,
+                                      bytes_per_pixel = image.info.num_bits / 8]() mutable {
         staging->Invalidate(0, download_size);
-        Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
-                                                  staging->mapped_data.data(), download_size);
+        if (pitched_rows) {
+            WriteBackPitchedRows(device_addr, staging->mapped_data.data(), download_size,
+                                 row_pitch, row_width, row_count, bytes_per_pixel);
+        } else {
+            Core::Memory::Instance()->TryWriteBacking(std::bit_cast<u8*>(device_addr),
+                                                      staging->mapped_data.data(),
+                                                      download_size);
+        }
         Skipcache::Framework::Instance().BumpMemGen();
         constexpr size_t MaxPooledBuffers = 8;
         constexpr u64 MaxPooledSize = 16_MB;
@@ -544,6 +588,16 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {depth_image_id, -1, -1};
         }
 
+        // Same surface rebound with a different extent, as dynamic resolution does. Recreate it
+        // and carry the rendered contents over instead of reloading it from guest memory.
+        if (image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.size != cache_image.info.size && image_info.type == cache_image.info.type &&
+            image_info.type != AmdGpu::ImageType::Color3D &&
+            image_info.resources == cache_image.info.resources && !image_info.props.is_block &&
+            !image_info.props.is_depth && cache_image.HasGpuValidData()) {
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
         // Compressed view of uncompressed image with same block size.
         if (image_info.props.is_block && !cache_image.info.props.is_block) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
@@ -552,6 +606,14 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
         if (image_info.guest_size == cache_image.info.guest_size &&
             (image_info.type == AmdGpu::ImageType::Color3D ||
              cache_image.info.type == AmdGpu::ImageType::Color3D)) {
+            return {ExpandImage(image_info, cache_image_id), -1, -1};
+        }
+
+        if (image_info.type == AmdGpu::ImageType::Color3D &&
+            cache_image.info.type == AmdGpu::ImageType::Color3D &&
+            image_info.pixel_format == cache_image.info.pixel_format &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.guest_size > cache_image.info.guest_size) {
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
@@ -771,7 +833,18 @@ ImageId TextureCache::ExpandImage(const ImageInfo& info, ImageId image_id) {
     // copying it would overwrite the fresh upload with old data.
     const bool src_has_gpu_data = src_image.HasGpuValidData();
 
-    RefreshImage(new_image);
+    const bool carry_only =
+        src_has_gpu_data && !new_image.info.props.is_block && !new_image.info.props.is_depth;
+    if (carry_only) {
+        const vk::ClearValue clear_value{.color = {.float32 = std::array<float, 4>{}}};
+        const SubresourceRange range{.base = {.level = 0, .layer = 0},
+                                     .extent = new_image.info.resources};
+        scheduler.EndRendering();
+        runtime.ClearImage(&new_image, range, clear_value);
+        new_image.flags |= ImageFlagBits::GpuModified;
+    } else {
+        RefreshImage(new_image);
+    }
 
     if (src_image.binding.is_bound || src_image.binding.is_target) {
         src_image.binding.needs_rebind = 1u;
@@ -1255,13 +1328,8 @@ ImageId TextureCache::FindImageSlow(ImageDesc& desc, bool exact_fmt, ImageId ima
 }
 
 ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure_valid) {
-    SmallVector<ImageId, 4> image_ids;
-    ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
-        if (ensure_valid && !image.HasGpuValidData()) {
-            return;
-        }
-        image_ids.push_back(image_id);
-    });
+    const auto image_ids =
+        FindImagesFromRange(address, size, ImageRange::MatchAddress, ensure_valid);
     if (image_ids.size() == 1) {
         // Sometimes image size might not exactly match with requested buffer size
         // If we only found 1 candidate image use it without too many questions.
@@ -1282,6 +1350,56 @@ ImageId TextureCache::FindImageFromRange(VAddr address, size_t size, bool ensure
                     size);
     }
     return {};
+}
+
+SmallVector<ImageId, 4> TextureCache::FindImagesFromRange(VAddr address, size_t size,
+                                                          ImageRange range, bool ensure_valid) {
+    SmallVector<ImageId, 4> image_ids;
+    if (range == ImageRange::MatchAddress) {
+        ForEachImageWithAddress(address, [&](ImageId image_id, Image& image) {
+            if (!ensure_valid || image.HasGpuValidData()) {
+                image_ids.push_back(image_id);
+            }
+        });
+        return image_ids;
+    }
+    if (size == 0 || address > std::numeric_limits<VAddr>::max() - size) {
+        return image_ids;
+    }
+    bool starts_at_image = false;
+    bool unsupported_image = false;
+    ForEachImageInRegion(address, size, [&](ImageId image_id, Image& image) {
+        if (ensure_valid && !image.HasGpuValidData()) {
+            return;
+        }
+        if (image.info.props.is_depth || image.info.num_samples != 1 ||
+            image.info.guest_address < address) {
+            unsupported_image = true;
+            return;
+        }
+        const u64 offset = image.info.guest_address - address;
+        if (offset >= size || image.info.guest_size == 0 || image.info.guest_size > size - offset) {
+            unsupported_image = true;
+            return;
+        }
+        starts_at_image |= image.info.guest_address == address;
+        image_ids.push_back(image_id);
+    });
+    if (!starts_at_image || unsupported_image) {
+        image_ids.clear();
+        return image_ids;
+    }
+    std::ranges::sort(image_ids, {},
+                      [&](ImageId id) { return slot_images[id].info.guest_address; });
+    for (size_t i = 1; i < image_ids.size(); ++i) {
+        const auto& previous = slot_images[image_ids[i - 1]].info;
+        const auto& current = slot_images[image_ids[i]].info;
+        if (current.guest_address - previous.guest_address < previous.guest_size) {
+            image_ids.clear();
+            break;
+        }
+    }
+    return image_ids;
 }
 
 vk::ImageView TextureCache::FindTexture(ImageId image_id, const ImageDesc& desc) {
@@ -1588,12 +1706,26 @@ void TextureCache::AssociateStencil(ImageId depth_id, const ImageInfo& depth_inf
 }
 
 void TextureCache::RefreshImage(Image& image) {
-    if (False(image.flags & ImageFlagBits::Dirty) || image.info.num_samples > 1) {
+    const bool msaa = image.info.num_samples > 1;
+    if (False(image.flags & ImageFlagBits::Dirty) ||
+        (msaa && (image.info.props.is_depth || image.info.resources.levels != 1 ||
+                  image.info.resources.layers != 1))) {
         return;
     }
 
     RENDERER_TRACE;
     TRACE_HINT(fmt::format("{:x}:{:x}", image.info.guest_address, image.info.guest_size));
+
+    if (image.usage.render_target && !image.info.props.is_depth &&
+        False(image.flags & ImageFlagBits::GpuModified)) {
+        const vk::ClearValue clear_value{.color = {.float32 = std::array<float, 4>{}}};
+        const SubresourceRange range{.base = {.level = 0, .layer = 0},
+                                     .extent = image.info.resources};
+        scheduler.EndRendering();
+        runtime.ClearImage(&image, range, clear_value);
+        image.flags &= ~ImageFlagBits::Dirty;
+        return;
+    }
 
     if (True(image.flags & ImageFlagBits::MaybeCpuDirty) &&
         False(image.flags & ImageFlagBits::CpuDirty)) {
@@ -1658,7 +1790,13 @@ void TextureCache::RefreshImage(Image& image) {
         copy.bufferOffset += offset;
     }
 
+    if (msaa) {
+        runtime.SetBackingSamples(&image, 1, false);
+    }
     runtime.UploadImage(&image, buffer, image_copies);
+    if (msaa) {
+        runtime.SetBackingSamples(&image, image.info.num_samples);
+    }
 }
 
 vk::Sampler TextureCache::GetSampler(const AmdGpu::Sampler& sharp,

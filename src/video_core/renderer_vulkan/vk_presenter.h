@@ -48,6 +48,9 @@ enum SchedulerType {
 
 class Rasterizer;
 
+constexpr u32 PsvrEyeFlipOption = 0x50535652;
+void SetPsvrEyeImage(const VideoCore::ImageInfo& info, const VideoCore::ImageViewInfo& view);
+
 class Presenter {
 public:
     Presenter(Frontend::WindowSDL& window, AmdGpu::Liverpool* liverpool);
@@ -108,7 +111,14 @@ private:
 
     void SetExpectedGameSize(s32 width, s32 height);
 
+    bool CopyPsvrEyeToHeadset(const CommandRecorder& cmdbuf, VideoCore::Image& image, bool swap_rb);
+
 private:
+    vk::Image xr_flip_image{};
+    VmaAllocation xr_flip_allocation{};
+    vk::Extent2D xr_flip_extent{};
+    vk::Format xr_flip_format{};
+
     float expected_ratio{1920.0 / 1080.0f};
     u32 expected_frame_width{1920};
     u32 expected_frame_height{1080};

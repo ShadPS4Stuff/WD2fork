@@ -12,6 +12,7 @@
 #include "core/file_sys/fs.h"
 #include "core/libraries/kernel/equeue.h"
 #include "core/libraries/kernel/kernel.h"
+#include "core/platform.h"
 #include "core/libraries/kernel/orbis_error.h"
 #include "core/libraries/kernel/posix_error.h"
 #include "core/libraries/kernel/time.h"
@@ -590,6 +591,7 @@ int PS4_SYSV_ABI sceKernelDeleteEqueue(OrbisKernelEqueue eq) {
 
     auto* handles = Common::Singleton<Core::FileSys::HandleTable>::Instance();
     handles->DeleteHandle(eq);
+    Platform::IrqC::Instance()->UnregisterAll(kqueues[eq]);
     delete kqueues[eq];
     kqueues.erase(eq);
     return ORBIS_OK;

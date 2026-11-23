@@ -12,6 +12,7 @@
 #include <variant>
 #include <vector>
 
+#include "common/logging/log.h"
 #include "core/net/guest_net.h"
 #include "core/net/p2p_transport.h"
 
@@ -1573,6 +1574,14 @@ static NetResult EpollWaitOn(const std::shared_ptr<GuestEpoll>& ep, std::span<Gu
                     continue;
                 }
                 u32 events = host_out[i].events;
+                {
+                    // TEMP WD2Reblumed: raw host events per socket, first 50 and every EvIn.
+                    static std::atomic<u32> logged{0};
+                    if ((events & Host::EvIn) != 0 || logged.fetch_add(1) < 50) {
+                        LOG_INFO(Lib_Net, "TEMP epoll eid-host events: socket {} host {:#x} want {:#x}",
+                                 socket_id, events, it->second.events);
+                    }
+                }
                 if (it->second.external) {
                     // Report once, the flag stays set.
                     const auto x = g_objects.Get<ExternalObject>(socket_id);

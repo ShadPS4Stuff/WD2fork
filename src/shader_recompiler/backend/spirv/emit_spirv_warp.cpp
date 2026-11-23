@@ -40,6 +40,11 @@ Id EmitShuffleXor(EmitContext& ctx, Id value, Id mask) {
     return ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask);
 }
 
+Id EmitClusteredUMin(EmitContext& ctx, Id value, Id cluster_size) {
+    return ctx.OpGroupNonUniformUMin(ctx.U32[1], SubgroupScope(ctx),
+                                     spv::GroupOperation::ClusteredReduce, value, cluster_size);
+}
+
 Id EmitReadLane(EmitContext& ctx, Id value, Id lane) {
     return ctx.OpGroupNonUniformBroadcast(ctx.U32[1], SubgroupScope(ctx), value, lane);
 }

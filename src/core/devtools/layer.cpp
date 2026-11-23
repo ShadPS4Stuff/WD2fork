@@ -16,7 +16,9 @@
 #include "imgui_internal.h"
 #include "options.h"
 #include "video_core/gr2_fsr3/gr2_fsr3.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/renderer_vulkan/vk_presenter.h"
+#include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "widget/frame_dump.h"
 #include "widget/frame_graph.h"
 #include "widget/gpu_memory.h"
@@ -29,6 +31,10 @@ extern std::unique_ptr<Vulkan::Presenter> presenter;
 using namespace ImGui;
 using namespace ::Core::Devtools;
 using L = ::Core::Devtools::Layer;
+
+static bool shader_skip_open = false;
+static bool predication_open = false;
+static bool shader_skip_compute_only = true;
 
 static bool show_simple_fps = false;
 static bool visibility_toggled = false;
@@ -132,6 +138,8 @@ void L::DrawMenuBar() {
         if (BeginMenu("Debug")) {
             MenuItem("Memory map", nullptr, &memory_map.open);
             MenuItem("Module list", nullptr, &module_list.open);
+            MenuItem("Shader skip list", nullptr, &shader_skip_open);
+            MenuItem("Predication", nullptr, &predication_open);
             ImGui::EndMenu();
         }
 
@@ -151,8 +159,239 @@ void L::DrawMenuBar() {
     }
 }
 
+static void DrawPredication() {
+    auto& rasterizer = presenter->GetRasterizer();
+    SetNextWindowSize({460.0f, 420.0f}, ImGuiCond_FirstUseEver);
+    if (!Begin("Predication", &predication_open)) {
+        End();
+        return;
+    }
+    int mode = Vulkan::Rasterizer::predication_mode;
+    bool mode_changed = RadioButton("Normal", &mode, 0);
+    SameLine();
+    mode_changed |= RadioButton("Never cull", &mode, 1);
+    SameLine();
+    mode_changed |= RadioButton("Always cull", &mode, 2);
+    if (mode_changed) {
+        Vulkan::Rasterizer::predication_mode = mode;
+    }
+    bool force_counting = Vulkan::Rasterizer::predication_force_counting;
+    if (Checkbox("Force occlusion counting on", &force_counting)) {
+        Vulkan::Rasterizer::predication_force_counting = force_counting;
+    }
+    const auto stats = rasterizer.GetPredicationStats();
+    Separator();
+    Text("Counting: %s", stats.counting ? "on" : "off");
+    Text("Predicates evaluated: %llu", static_cast<unsigned long long>(stats.packets));
+    Text("  culled: %llu  drawn: %llu  not final: %llu",
+         static_cast<unsigned long long>(stats.culled),
+         static_cast<unsigned long long>(stats.drawn),
+         static_cast<unsigned long long>(stats.unknown));
+    Text("Predicated packets skipped: %llu",
+         static_cast<unsigned long long>(stats.skipped_packets));
+    Text("Counter dumps: %llu  inexact windows: %llu", static_cast<unsigned long long>(stats.dumps),
+         static_cast<unsigned long long>(stats.inexact_windows));
+    Text("Queries issued: %llu  free slots: %u", static_cast<unsigned long long>(stats.queries),
+         stats.free_slots);
+    if (Button("Reset stats")) {
+        rasterizer.ResetPredicationStats();
+    }
+    Separator();
+    bool skip_dingdong_wait = DebugState.skip_dingdong_idle_wait;
+    if (Checkbox("Skip GPU idle wait in DingDong", &skip_dingdong_wait)) {
+        DebugState.skip_dingdong_idle_wait = skip_dingdong_wait;
+    }
+    bool skip_submit_wait = DebugState.skip_submit_idle_wait;
+    if (Checkbox("Skip GPU idle wait in SubmitCommandBuffers", &skip_submit_wait)) {
+        DebugState.skip_submit_idle_wait = skip_submit_wait;
+    }
+    Separator();
+    {
+        using VideoCore::BufferCache;
+        static u64 last_requests = 0, last_stalls = 0, last_bytes = 0, last_fast = 0;
+        static float rate_requests = 0, rate_stalls = 0, rate_kb = 0, rate_fast = 0;
+        static double last_time = 0;
+        const double now = GetTime();
+        if (now - last_time >= 1.0) {
+            const float span = static_cast<float>(now - last_time);
+            const u64 requests = BufferCache::readback_requests;
+            const u64 stalls = BufferCache::readback_stalls;
+            const u64 bytes = BufferCache::readback_bytes;
+            rate_requests = static_cast<float>(requests - last_requests) / span;
+            rate_stalls = static_cast<float>(stalls - last_stalls) / span;
+            const u64 fast = BufferCache::readback_fast;
+            rate_fast = static_cast<float>(fast - last_fast) / span;
+            last_fast = fast;
+            rate_kb = static_cast<float>(bytes - last_bytes) / span / 1024.0f;
+            last_requests = requests;
+            last_stalls = stalls;
+            last_bytes = bytes;
+            last_time = now;
+        }
+        Text("Readbacks per second: %.0f requests, %.0f GPU stalls, %.0f fast, %.0f KB",
+             rate_requests, rate_stalls, rate_fast, rate_kb);
+        static constexpr u32 WindowSizesKb[] = {512, 2048, 8192, 32768, 131072, 524288};
+        static constexpr const char* WindowLabels[] = {"512 KB", "2 MB",   "8 MB",
+                                                       "32 MB",  "128 MB", "512 MB"};
+        static constexpr const char* LiveModes[] = {
+            "Precise (wait for GPU)", "Deferred (no wait, data arrives late)", "Skip (no data)",
+            "Optimized precise (experimental)"};
+        int live_mode = static_cast<int>(BufferCache::readback_live_mode.load());
+        if (Combo("Readback mode", &live_mode, LiveModes, IM_ARRAYSIZE(LiveModes))) {
+            BufferCache::readback_live_mode = static_cast<u32>(live_mode);
+        }
+        static int window_index = 0;
+        if (Combo("Readback window", &window_index, WindowLabels, IM_ARRAYSIZE(WindowLabels))) {
+            BufferCache::readback_window_kb = WindowSizesKb[window_index];
+        }
+    }
+    Separator();
+    if (BeginTable("##predication", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        TableSetupColumn("Address");
+        TableSetupColumn("Counters");
+        TableSetupColumn("Draw visible", ImGuiTableColumnFlags_WidthFixed);
+        TableSetupColumn("Result", ImGuiTableColumnFlags_WidthFixed);
+        TableHeadersRow();
+        for (const auto& decision : rasterizer.GetPredicationDecisions()) {
+            TableNextRow();
+            TableNextColumn();
+            Text("%#llx", static_cast<unsigned long long>(decision.address));
+            TableNextColumn();
+            Text("%s", decision.state == 0   ? "not final"
+                       : decision.state == 1 ? "visible"
+                                             : "occluded");
+            TableNextColumn();
+            Text("%d", decision.draw_visible ? 1 : 0);
+            TableNextColumn();
+            Text("%s", decision.skipped ? "culled" : "drawn");
+        }
+        EndTable();
+    }
+    End();
+}
+
+static void DrawShaderSkipList() {
+    auto& rasterizer = presenter->GetRasterizer();
+    SetNextWindowSize({420.0f, 500.0f}, ImGuiCond_FirstUseEver);
+    if (!Begin("Shader skip list", &shader_skip_open)) {
+        End();
+        return;
+    }
+    static int capture_images = 200;
+    static int capture_min_size = 128;
+    const u32 capture_remaining = rasterizer.PassCaptureRemaining();
+    SliderInt("Images", &capture_images, 10, 1000);
+    SliderInt("Min size", &capture_min_size, 16, 1920);
+    static bool capture_compute_only = true;
+    Checkbox("Compute passes only", &capture_compute_only);
+    static u64 capture_buffer_hash = 0;
+    char capture_preview[32];
+    if (capture_buffer_hash == 0) {
+        std::snprintf(capture_preview, sizeof(capture_preview), "none");
+    } else {
+        std::snprintf(capture_preview, sizeof(capture_preview), "%#010llx",
+                      static_cast<unsigned long long>(capture_buffer_hash));
+    }
+    if (BeginCombo("Buffers of shader", capture_preview)) {
+        if (Selectable("none", capture_buffer_hash == 0)) {
+            capture_buffer_hash = 0;
+        }
+        for (const auto& entry : rasterizer.GetShaderSkipEntries()) {
+            if (shader_skip_compute_only && entry.stage != Shader::SwStage::Compute) {
+                continue;
+            }
+            char label[32];
+            std::snprintf(label, sizeof(label), "%#010llx",
+                          static_cast<unsigned long long>(entry.hash));
+            if (Selectable(label, capture_buffer_hash == entry.hash)) {
+                capture_buffer_hash = entry.hash;
+            }
+        }
+        EndCombo();
+    }
+    if (capture_remaining != 0) {
+        Text("Capturing... %u left", capture_remaining);
+    } else if (Button("Capture passes")) {
+        rasterizer.StartPassCapture(static_cast<u32>(capture_images),
+                                    static_cast<u32>(capture_min_size), capture_buffer_hash,
+                                    capture_compute_only);
+    }
+    Separator();
+    std::vector<Vulkan::Rasterizer::ShaderSkipEntry> visible;
+    for (const auto& entry : rasterizer.GetShaderSkipEntries()) {
+        if (!shader_skip_compute_only || entry.stage == Shader::SwStage::Compute) {
+            visible.push_back(entry);
+        }
+    }
+    const auto set_range = [&](size_t first, size_t last, bool skipped) {
+        for (size_t i = first; i < last; ++i) {
+            rasterizer.SetShaderSkipped(visible[i].hash, skipped);
+        }
+    };
+    const size_t half = visible.size() / 2;
+    if (Button("Clear all")) {
+        rasterizer.ClearShaderSkips();
+    }
+    SameLine();
+    Checkbox("Compute only", &shader_skip_compute_only);
+    bool ignore_stencil = Vulkan::Rasterizer::ignore_float_target_stencil;
+    if (Checkbox("Ignore stencil on half-res lighting draws", &ignore_stencil)) {
+        Vulkan::Rasterizer::ignore_float_target_stencil = ignore_stencil;
+    }
+    bool ignore_readers = Vulkan::Rasterizer::ignore_stencil_readers;
+    if (Checkbox("Ignore stencil on all draws that only test it", &ignore_readers)) {
+        Vulkan::Rasterizer::ignore_stencil_readers = ignore_readers;
+    }
+    if (Button("Skip 1st half")) {
+        rasterizer.ClearShaderSkips();
+        set_range(0, half, true);
+    }
+    SameLine();
+    if (Button("Skip 2nd half")) {
+        rasterizer.ClearShaderSkips();
+        set_range(half, visible.size(), true);
+    }
+    SameLine();
+    if (Button("Skip all")) {
+        set_range(0, visible.size(), true);
+    }
+    Separator();
+    if (BeginTable("##shader_skip", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY)) {
+        TableSetupColumn("Skip", ImGuiTableColumnFlags_WidthFixed);
+        TableSetupColumn("Hash");
+        TableSetupColumn("Stage");
+        TableSetupColumn("Uses", ImGuiTableColumnFlags_WidthFixed);
+        TableHeadersRow();
+        for (const auto& entry : visible) {
+            TableNextRow();
+            TableNextColumn();
+            bool skipped = entry.skipped;
+            PushID(static_cast<int>(entry.hash));
+            if (Checkbox("##skip", &skipped)) {
+                rasterizer.SetShaderSkipped(entry.hash, skipped);
+            }
+            PopID();
+            TableNextColumn();
+            Text("%#010llx", static_cast<unsigned long long>(entry.hash));
+            TableNextColumn();
+            Text("%u", static_cast<u32>(entry.stage));
+            TableNextColumn();
+            Text("%llu", static_cast<unsigned long long>(entry.count));
+        }
+        EndTable();
+    }
+    End();
+}
+
 void L::DrawAdvanced() {
     DrawMenuBar();
+
+    if (shader_skip_open) {
+        DrawShaderSkipList();
+    }
+    if (predication_open) {
+        DrawPredication();
+    }
 
     const auto& ctx = *GImGui;
     const auto& io = ctx.IO;

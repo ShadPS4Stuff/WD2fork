@@ -73,6 +73,7 @@ void SettingsWindow::LoadSettings(std::string profile) {
     gyroInvertXSetting = EmulatorSettings.IsGyroInvertX();
     gyroInvertRollSetting = EmulatorSettings.IsGyroInvertRoll();
     backgroundControllerSetting = EmulatorSettings.IsBackgroundControllerInput();
+    psvrEmuTestSetting = EmulatorSettings.IsPsvrEmuTest();
     cursorStateSetting = EmulatorSettings.GetCursorState();
     cursorTimeoutSetting = EmulatorSettings.GetCursorHideTimeout();
 
@@ -135,6 +136,7 @@ void SettingsWindow::SaveSettings(std::string profile) {
     EmulatorSettings.SetGyroInvertX(gyroInvertXSetting, isSpecific);
     EmulatorSettings.SetGyroInvertRoll(gyroInvertRollSetting, isSpecific);
     EmulatorSettings.SetBackgroundControllerInput(backgroundControllerSetting, isSpecific);
+    EmulatorSettings.SetPsvrEmuTest(psvrEmuTestSetting, isSpecific);
     EmulatorSettings.SetCursorState(cursorStateSetting, isSpecific);
     EmulatorSettings.SetCursorHideTimeout(cursorTimeoutSetting, isSpecific);
 
@@ -760,6 +762,7 @@ void SettingsWindow::DrawSettingsTable(SettingsCategory category) {
             AddSettingCheckbox("Gyro: Invert Pitch", gyroInvertXSetting);
             AddSettingCheckbox("Gyro: Invert Roll", gyroInvertRollSetting);
             AddSettingCheckbox("Enable Background Controller Input", backgroundControllerSetting);
+            AddSettingCheckbox("PSVR Emulation Test (keyboard)", psvrEmuTestSetting);
             AddSettingCombo("Hide Cursor", cursorStateSetting, hideCursorOptions);
 
             if (cursorStateSetting == 1) {

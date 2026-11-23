@@ -50,6 +50,7 @@ void Scheduler::BeginRendering(const RenderState& new_state) {
                  (std::memcmp(&render_state, &new_state, sizeof(RenderState)) == 0));
 #endif
     rs_interrupted_ += !is_rendering;
+    RENDERER_TRACE;
     if (is_rendering && render_state == new_state) {
         return;
     }
@@ -369,6 +370,9 @@ void Scheduler::SubmitExecution(SubmitInfo& info) {
 
     ImGui::Core::TextureManager::Submit();
     auto submit_result = instance.GetGraphicsQueue().submit(submit_info, info.fence);
+    if (submit_result == vk::Result::eErrorDeviceLost) {
+        instance.LogDeviceFault();
+    }
     ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
 
     work_semaphore.Refresh();

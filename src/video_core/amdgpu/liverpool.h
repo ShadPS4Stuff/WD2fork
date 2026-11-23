@@ -85,6 +85,8 @@ public:
         submit_cv.notify_one();
     }
 
+    void LogQueueState();
+
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
         submit_cv.wait(lk, [this] { return num_submits == 0; });
@@ -289,12 +291,22 @@ private:
         ComputeProgram cs_state{};
     };
     std::array<GpuQueue, NumTotalQueues> mapped_queues{};
+
+    struct QueueWait {
+        const char* kind;
+        u64 address;
+        u32 function;
+        u32 reference;
+        u32 mask;
+    };
+    std::array<QueueWait, 65> queue_waits{};
     std::queue<Task::Handle> ce_submits;
     u32 num_mapped_queues{1u}; // GFX is always available
 
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+    bool predicate_skip{};
     u32 vgt_strmout_buffer_filled_size[4]{};
     // Frozen counter = every query pair differences to zero samples passed:
     // the title's own visibility logic then culls those draws before issue.

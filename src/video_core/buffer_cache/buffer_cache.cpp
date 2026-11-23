@@ -3,10 +3,12 @@
 
 #include <algorithm>
 #include <chrono>
+#include <limits>
 #include <magic_enum/magic_enum.hpp>
 #include <xxhash.h>
 
 #include "common/alignment.h"
+#include "common/debug.h"
 #include "common/scope_exit.h"
 #include "common/stream_copy.h"
 #include "core/debug_state.h"
@@ -153,6 +155,9 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
     bda_pagetable_buffer = std::make_unique<Buffer>(
         instance, 0, bda_pagetable_size, MemoryType::DeviceLocal, "BDA Page Table Buffer");
     runtime.FillBuffer(bda_pagetable_buffer.get(), 0u, bda_pagetable_size, 0u);
+    if (EmulatorSettings.GetReadbacksMode() == GpuReadbacksMode::PreciseOptimized) {
+        readback_live_mode = 3;
+    }
     if (!instance.IsMaintenance6Supported()) {
         null_index_buffer = std::make_unique<Buffer>(instance, 0, NULL_INDEX_BUFFER_SIZE,
                                                      MemoryType::DeviceLocal, "Null Index Buffer");
@@ -172,6 +177,96 @@ BufferCache::BufferCache(const Vulkan::Instance& instance_, Vulkan::Scheduler& s
 
 BufferCache::~BufferCache() = default;
 
+void BufferCache::NotePendingWrite(VAddr addr, u64 size) {
+    if (readback_live_mode != 3) {
+        return;
+    }
+    const u64 tick = scheduler.CurrentTick();
+    if (tick != pending_writes_tick) {
+        pending_writes.Clear();
+        pending_writes_tick = tick;
+    }
+    pending_writes.Add(addr, size);
+}
+
+bool BufferCache::CanReadBackEarly(VAddr addr, u64 size) const {
+    if (readback_live_mode.load(std::memory_order_relaxed) != 3 || !pending_binds.empty() ||
+        EmulatorSettings.IsDirectMemoryAccessEnabled()) {
+        return false;
+    }
+    return pending_writes_tick != scheduler.CurrentTick() || !pending_writes.Intersects(addr, size);
+}
+
+void BufferCache::CopyForReadback(const Buffer* arena, const Buffer* staging,
+                                  std::span<const vk::BufferCopy> copies) {
+    const auto device = instance.GetDevice();
+    if (!readback_pool) {
+        readback_pool = Vulkan::Check(device.createCommandPoolUnique(vk::CommandPoolCreateInfo{
+            .flags = vk::CommandPoolCreateFlagBits::eTransient |
+                     vk::CommandPoolCreateFlagBits::eResetCommandBuffer,
+            .queueFamilyIndex = instance.GetGraphicsQueueFamilyIndex(),
+        }));
+        auto cmdbufs =
+            Vulkan::Check(device.allocateCommandBuffersUnique(vk::CommandBufferAllocateInfo{
+                .commandPool = *readback_pool,
+                .level = vk::CommandBufferLevel::ePrimary,
+                .commandBufferCount = 1,
+            }));
+        readback_cmdbuf = std::move(cmdbufs[0]);
+        readback_fence = Vulkan::Check(device.createFenceUnique({}));
+    }
+
+    const auto cmdbuf = *readback_cmdbuf;
+    Vulkan::Check(cmdbuf.begin(vk::CommandBufferBeginInfo{
+        .flags = vk::CommandBufferUsageFlagBits::eOneTimeSubmit,
+    }));
+    const vk::MemoryBarrier2 before_copy = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eMemoryWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &before_copy,
+    });
+    cmdbuf.copyBuffer(arena->Handle(), staging->Handle(), copies);
+    const vk::MemoryBarrier2 after_copy = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eCopy,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &after_copy,
+    });
+    Vulkan::Check(cmdbuf.end());
+
+    const u64 last_bind_tick = memory_semaphore.CurrentTick() - 1;
+    const vk::Semaphore bind_semaphore = memory_semaphore.Handle();
+    constexpr vk::PipelineStageFlags wait_stage = vk::PipelineStageFlagBits::eAllCommands;
+    const vk::TimelineSemaphoreSubmitInfo timeline_info = {
+        .waitSemaphoreValueCount = last_bind_tick > 0 ? 1u : 0u,
+        .pWaitSemaphoreValues = &last_bind_tick,
+    };
+    const vk::SubmitInfo submit_info = {
+        .pNext = &timeline_info,
+        .waitSemaphoreCount = last_bind_tick > 0 ? 1u : 0u,
+        .pWaitSemaphores = &bind_semaphore,
+        .pWaitDstStageMask = &wait_stage,
+        .commandBufferCount = 1,
+        .pCommandBuffers = &cmdbuf,
+    };
+    {
+        std::scoped_lock lock{Vulkan::Scheduler::SubmitMutex()};
+        Vulkan::Check(instance.GetGraphicsQueue().submit(submit_info, *readback_fence));
+    }
+    Vulkan::Check(device.waitForFences(*readback_fence, true, std::numeric_limits<u64>::max()));
+    Vulkan::Check(device.resetFences(*readback_fence));
+    Vulkan::Check(cmdbuf.reset());
+}
+
 void BufferCache::TickFrame() {
     if (std::exchange(fault_process_pending, false)) {
         fault_manager->ProcessFaultBuffer();
@@ -190,6 +285,12 @@ void BufferCache::UnmarkRegionAsGpuModified(VAddr device_addr, u64 size, bool is
 
 void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool async,
                              bool assume_locks) {
+    readback_requests.fetch_add(1, std::memory_order_relaxed);
+    const u32 live_mode = readback_live_mode.load(std::memory_order_relaxed);
+    if (live_mode == 2 && !is_write) {
+        return;
+    }
+    async |= live_mode == 1;
     if (readback_offload && !async &&
         (assume_locks ? GpuThreadReadback(device_addr, size, is_write)
                       : FaultReadback(device_addr, size, is_write))) {
@@ -205,10 +306,11 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
             // GPU-modified ranges come as many small scattered islands, so a fault's download is
             // widened to a window around the request and ends on the page boundary the consume
             // clears up to; an asynchronous caller owns exactly the pages of its range.
+            const u64 window_size = std::max<u64>(
+                READBACK_WINDOW_SIZE, u64(readback_window_kb.load(std::memory_order_relaxed)) * 1_KB);
             const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
-            start = std::max<VAddr>(Common::AlignDown(device_addr, READBACK_WINDOW_SIZE),
-                                    arena->cpu_addr);
-            end = std::min<VAddr>(std::max<VAddr>(start + READBACK_WINDOW_SIZE, end), arena_end);
+            start = std::max<VAddr>(Common::AlignDown(device_addr, window_size), arena->cpu_addr);
+            end = std::min<VAddr>(std::max<VAddr>(start + window_size, end), arena_end);
         }
         DownloadMemory(arena, start, end - start, async);
         if (is_write) {
@@ -270,12 +372,22 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
         }
         return;
     }
+    const bool early = !async && CanReadBackEarly(device_addr, size);
+    (async   ? readback_async
+     : early ? readback_fast
+             : readback_stalls)
+        .fetch_add(1, std::memory_order_relaxed);
+    readback_bytes.fetch_add(total_size_bytes, std::memory_order_relaxed);
     const auto download =
         staging_pool.Request(total_size_bytes, VideoCore::MemoryType::HostCached, 16, async);
     for (auto& copy : copies) {
         copy.dstOffset += download.offset;
     }
-    runtime.CopyBuffer(arena, download.buffer, copies);
+    if (early) {
+        CopyForReadback(arena, download.buffer, copies);
+    } else {
+        runtime.CopyBuffer(arena, download.buffer, copies);
+    }
     const u64 record_tick = scheduler.CurrentTick();
 
     const auto write_data = [this, arena_base, device_addr, size, download, async, own_window,
@@ -298,7 +410,9 @@ void BufferCache::DownloadMemory(const Buffer* arena, VAddr device_addr, u64 siz
     if (async) {
         scheduler.DeferOperation(std::move(write_data));
     } else {
-        scheduler.Finish();
+        if (!early) {
+            scheduler.Finish();
+        }
         write_data();
     }
 }
@@ -519,9 +633,17 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
     const bool is_written = True(flags & ObtainBufferFlags::IsWritten);
     const bool is_texel_buffer = True(flags & ObtainBufferFlags::IsTexelBuffer);
     const bool skip_stream_buffer = True(flags & ObtainBufferFlags::IgnoreStreamBuffer);
+    RENDERER_TRACE;
+    SmallVector<ImageId, 4> rendered_images;
+    if (!is_texel_buffer) {
+        ZoneScopedN("FindImagesFromRange");
+        rendered_images = texture_cache.FindImagesFromRange(device_addr, size,
+                                                            TextureCache::ImageRange::Contained);
+    }
     // For read-only buffers use device local stream buffer to reduce renderpass breaks.
-    if (!is_written && !skip_stream_buffer && size <= STREAM_THRESHOLD &&
+    if (!is_written && !skip_stream_buffer && rendered_images.empty() && size <= STREAM_THRESHOLD &&
         !IsRegionGpuModified(device_addr, size)) {
+        ZoneScopedN("StreamBufferCopy");
         if (const auto lane_offset = StreamViaLane(device_addr, size)) {
             return {&stream_buffer, *lane_offset};
         }
@@ -541,6 +663,9 @@ std::pair<const Buffer*, u64> BufferCache::ObtainBuffer(VAddr device_addr, u32 s
         StampGpuWrite(device_addr, size);
     }
     SynchronizeMemory(arena, device_addr, size, is_written, is_texel_buffer);
+    if (is_written) {
+        NotePendingWrite(device_addr, size);
+    }
     return {arena, arena->Offset(device_addr)};
 }
 
@@ -604,6 +729,7 @@ void BufferCache::MarkRegionAsGpuModified(VAddr addr, size_t size) {
     texture_cache.MarkAsMaybeGpuDirty(addr, size);
     StampGpuWrite(addr, size);
     memory_tracker->MarkRegionAsGpuModified(addr, size);
+    NotePendingWrite(addr, size);
 }
 
 void BufferCache::StampGpuWrite(VAddr device_addr, u64 size) {
@@ -838,7 +964,8 @@ void BufferCache::EnsureResident(const Buffer* arena, u64 first_block, u64 last_
 }
 
 bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 size,
-                                    bool is_written, bool is_texel_buffer) {
+                                    bool is_written, bool is_texel_buffer,
+                                    std::span<const ImageId> image_ids) {
     boost::container::small_vector<vk::BufferCopy, 4> copies;
     size_t total_size_bytes{};
     // A read-only bind over pages without a CPU write uploads nothing and moves no page state.
@@ -864,73 +991,81 @@ bool BufferCache::SynchronizeMemory(const Buffer* arena, VAddr device_addr, u32 
         staging.Flush();
         runtime.CopyBuffer(staging.buffer, arena, copies);
     }
-    if (is_texel_buffer && !is_written) {
-        return SynchronizeMemoryFromImage(arena, device_addr, size);
+    if (!image_ids.empty() || (is_texel_buffer && !is_written)) {
+        NotePendingWrite(device_addr, size);
+        return SynchronizeMemoryFromImage(arena, device_addr, size, image_ids);
     }
     return false;
 }
 
-bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size) {
-    if (const auto meta = texture_cache.GetMetaInfo(device_addr)) {
-        if (meta->type == TextureCache::MetaType::HTile) {
-            static constexpr u32 ZmaskUncompressed = 0xf;
-            runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
-            return true;
-        } else if (meta->type == TextureCache::MetaType::CMask) {
-            const auto expanded_value = CmaskColorExpandedValue(meta->num_samples);
-            if (!expanded_value) {
-                LOG_WARNING(Render_Vulkan,
-                            "Unsupported CMask sample count: address={:#x}, size={:#x}, "
-                            "samples={}, owner={}:{}",
-                            device_addr, size, meta->num_samples, meta->owner_id.index,
-                            meta->owner_uid);
-                return false;
+bool BufferCache::SynchronizeMemoryFromImage(const Buffer* arena, VAddr device_addr, u32 size,
+                                             std::span<const ImageId> image_ids) {
+    ImageId single_image_id;
+    if (image_ids.empty()) {
+        if (const auto meta = texture_cache.GetMetaInfo(device_addr)) {
+            if (meta->type == TextureCache::MetaType::HTile) {
+                static constexpr u32 ZmaskUncompressed = 0xf;
+                runtime.FillBuffer(arena, arena->Offset(device_addr), size, ZmaskUncompressed);
+                return true;
+            } else if (meta->type == TextureCache::MetaType::CMask) {
+                const auto expanded_value = CmaskColorExpandedValue(meta->num_samples);
+                if (!expanded_value) {
+                    LOG_WARNING(Render_Vulkan,
+                                "Unsupported CMask sample count: address={:#x}, size={:#x}, "
+                                "samples={}, owner={}:{}",
+                                device_addr, size, meta->num_samples, meta->owner_id.index,
+                                meta->owner_uid);
+                    return false;
+                }
+                runtime.FillBuffer(arena, arena->Offset(device_addr), size, *expanded_value);
+                return true;
+            } else {
+                LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}",
+                            magic_enum::enum_name(meta->type));
             }
-            runtime.FillBuffer(arena, arena->Offset(device_addr), size, *expanded_value);
-            return true;
-        } else {
-            LOG_WARNING(Render_Vulkan, "Unhandled metadata type {}",
-                        magic_enum::enum_name(meta->type));
+        }
+        single_image_id = texture_cache.FindImageFromRange(device_addr, size);
+        if (!single_image_id) {
+            return false;
+        }
+        ASSERT_MSG(device_addr == texture_cache.GetImage(single_image_id).info.guest_address,
+                   "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
+                   texture_cache.GetImage(single_image_id).info.guest_address);
+        image_ids = {&single_image_id, 1};
+    }
+    bool copied = false;
+    for (const ImageId image_id : image_ids) {
+        Image& image = texture_cache.GetImage(image_id);
+        const u64 arena_offset = arena->Offset(image.info.guest_address);
+        boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
+        for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
+            const auto& mip_info = image.info.mips_layout[mip];
+            const u32 width = std::max(image.info.size.width >> mip, 1u);
+            const u32 height = std::max(image.info.size.height >> mip, 1u);
+            const u32 depth = std::max(image.info.size.depth >> mip, 1u);
+            if (arena_offset + mip_info.offset + mip_info.size > arena->size_bytes) {
+                break;
+            }
+            buffer_copies.push_back(vk::BufferImageCopy{
+                .bufferOffset = mip_info.offset,
+                .bufferRowLength = mip_info.pitch,
+                .bufferImageHeight = mip_info.height,
+                .imageSubresource{
+                    .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
+                    .mipLevel = mip,
+                    .baseArrayLayer = 0,
+                    .layerCount = image.info.resources.layers,
+                },
+                .imageOffset = {0, 0, 0},
+                .imageExtent = {width, height, depth},
+            });
+        }
+        if (!buffer_copies.empty()) {
+            texture_cache.GetTileManager().TileImage(image, buffer_copies, arena, arena_offset);
+            copied = true;
         }
     }
-    const ImageId image_id = texture_cache.FindImageFromRange(device_addr, size);
-    if (!image_id) {
-        return false;
-    }
-    Image& image = texture_cache.GetImage(image_id);
-    ASSERT_MSG(device_addr == image.info.guest_address,
-               "Texel buffer aliases image subresources {:x} : {:x}", device_addr,
-               image.info.guest_address);
-    const u64 arena_offset = arena->Offset(device_addr);
-    boost::container::small_vector<vk::BufferImageCopy, 8> buffer_copies;
-    for (u32 mip = 0; mip < image.info.resources.levels; mip++) {
-        const auto& mip_info = image.info.mips_layout[mip];
-        const u32 width = std::max(image.info.size.width >> mip, 1u);
-        const u32 height = std::max(image.info.size.height >> mip, 1u);
-        const u32 depth = std::max(image.info.size.depth >> mip, 1u);
-        if (arena_offset + mip_info.offset + mip_info.size > arena->size_bytes) {
-            break;
-        }
-        buffer_copies.push_back(vk::BufferImageCopy{
-            .bufferOffset = mip_info.offset,
-            .bufferRowLength = mip_info.pitch,
-            .bufferImageHeight = mip_info.height,
-            .imageSubresource{
-                .aspectMask = image.aspect_mask & ~vk::ImageAspectFlagBits::eStencil,
-                .mipLevel = mip,
-                .baseArrayLayer = 0,
-                .layerCount = image.info.resources.layers,
-            },
-            .imageOffset = {0, 0, 0},
-            .imageExtent = {width, height, depth},
-        });
-    }
-    if (buffer_copies.empty()) {
-        return false;
-    }
-    auto& tile_manager = texture_cache.GetTileManager();
-    tile_manager.TileImage(image, buffer_copies, arena, arena_offset);
-    return true;
+    return copied;
 }
 
 void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
@@ -974,6 +1109,9 @@ void BufferCache::SubmitPendingArenaBinds(Vulkan::SubmitInfo& info) {
             submit_lock.lock();
         }
         auto submit_result = instance.GetGraphicsQueue().bindSparse(sparse_info);
+        if (submit_result == vk::Result::eErrorDeviceLost) {
+            instance.LogDeviceFault();
+        }
         ASSERT_MSG(submit_result != vk::Result::eErrorDeviceLost, "Device lost during submit");
     }
 

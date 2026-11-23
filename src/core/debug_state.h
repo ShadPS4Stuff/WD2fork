@@ -167,6 +167,9 @@ class DebugStateImpl {
     std::vector<ShaderDump> shader_dump_list{};
 
 public:
+    std::atomic_bool skip_dingdong_idle_wait = false;
+    std::atomic_bool skip_submit_idle_wait = false;
+
     float Framerate = 1.0f / 60.0f;
     float FrameDeltaTime;
 

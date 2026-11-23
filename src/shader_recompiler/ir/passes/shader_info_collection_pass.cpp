@@ -166,6 +166,9 @@ void Visit(Info& info, const IR::Inst& inst, Profile const& profile) {
     case IR::Opcode::ShuffleXor:
         info.uses_group_shuffle = true;
         break;
+    case IR::Opcode::ClusteredUMin:
+        info.uses_group_clustered = true;
+        break;
     case IR::Opcode::ReadLane:
     case IR::Opcode::ReadFirstLane:
     case IR::Opcode::WriteLane:

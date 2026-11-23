@@ -9,6 +9,7 @@
 #include "core/libraries/error_codes.h"
 #include "core/libraries/kernel/memory.h"
 #include "core/libraries/kernel/process.h"
+#include "core/libraries/kernel/time.h"
 #include "core/libraries/libs.h"
 #include "core/memory.h"
 
@@ -29,6 +30,11 @@ static u16 *raw16_buffer1{}, *raw16_buffer2{};
 static u8 *raw8_buffer1{}, *raw8_buffer2{};
 
 SDL_Camera* sdl_camera = nullptr;
+
+static bool IsBlankPsvrCamera() {
+    return EmulatorSettings.GetCameraId() == -1 && EmulatorSettings.IsPsvrEmuTest();
+}
+
 OrbisCameraConfigExtention output_config0, output_config1;
 
 s32 PS4_SYSV_ABI sceCameraAccGetData() {
@@ -90,21 +96,24 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
     if (handle < 1 || frame_data->sizeThis > 584) {
         return ORBIS_CAMERA_ERROR_PARAM;
     }
-    if (!g_library_opened || !sdl_camera) {
+    const bool blank_camera = IsBlankPsvrCamera();
+    if (!g_library_opened || (!sdl_camera && !blank_camera)) {
         return ORBIS_CAMERA_ERROR_NOT_OPEN;
     }
-    if (EmulatorSettings.GetCameraId() == -1) {
+    if (EmulatorSettings.GetCameraId() == -1 && !blank_camera) {
         return ORBIS_CAMERA_ERROR_NOT_CONNECTED;
     }
     Uint64 timestampNS = 0;
     static SDL_Surface* frame = nullptr;
-    if (frame) { // release previous frame, if it exists
-        SDL_ReleaseCameraFrame(sdl_camera, frame);
+    if (!blank_camera) {
+        if (frame) { // release previous frame, if it exists
+            SDL_ReleaseCameraFrame(sdl_camera, frame);
+        }
+        frame = SDL_AcquireCameraFrame(sdl_camera, &timestampNS);
     }
-    frame = SDL_AcquireCameraFrame(sdl_camera, &timestampNS);
 
-    frame_data->status[0] = frame != nullptr ? 1 : -1;
-    frame_data->status[1] = frame != nullptr ? 1 : -1;
+    frame_data->status[0] = frame != nullptr || blank_camera ? 1 : -1;
+    frame_data->status[1] = frame != nullptr || blank_camera ? 1 : -1;
     if (!frame) {
         switch (output_config0.format.formatLevel0) {
         case ORBIS_CAMERA_FORMAT_YUV422:
@@ -131,6 +140,20 @@ s32 PS4_SYSV_ABI sceCameraGetFrameData(s32 handle, OrbisCameraFrameData* frame_d
             break;
         default:
             UNREACHABLE();
+        }
+        if (blank_camera) {
+            static u64 blank_frame_number = 0;
+            ++blank_frame_number;
+            const u64 now = Libraries::Kernel::sceKernelGetProcessTime();
+            for (s32 device = 0; device < ORBIS_CAMERA_MAX_DEVICE_NUM; ++device) {
+                frame_data->pFramePointerListGarlic[device][0] =
+                    frame_data->pFramePointerList[device][0];
+                frame_data->frameSize[device][0] = c_width * c_height * sizeof(u16);
+                frame_data->meta.frame[device] = blank_frame_number;
+                frame_data->meta.timestamp[device] = now;
+                frame_data->meta.deviceTimestamp[device] = static_cast<u32>(now);
+            }
+            frame_data->meta.vcounter = blank_frame_number;
         }
         return frame_data->pFramePointerList[0][0] == nullptr ? ORBIS_CAMERA_ERROR_BUSY : ORBIS_OK;
     }
@@ -196,7 +219,7 @@ s32 PS4_SYSV_ABI sceCameraIsAttached(s32 index) {
         return ORBIS_CAMERA_ERROR_PARAM;
     }
     // 0 = disconnected, 1 = connected
-    return EmulatorSettings.GetCameraId() == -1 ? 0 : 1;
+    return EmulatorSettings.GetCameraId() == -1 && !EmulatorSettings.IsPsvrEmuTest() ? 0 : 1;
 }
 
 s32 PS4_SYSV_ABI sceCameraIsConfigChangeDone() {
@@ -296,6 +319,10 @@ s32 PS4_SYSV_ABI sceCameraStart(s32 handle, OrbisCameraStartParameter* param) {
 
     if (param->formatLevel[0] > 1 || param->formatLevel[1] > 1) {
         LOG_ERROR(Lib_Camera, "Downscaled image retrieval isn't supported yet!");
+    }
+
+    if (IsBlankPsvrCamera()) {
+        return ORBIS_OK;
     }
 
     SDL_CameraID* devices = NULL;

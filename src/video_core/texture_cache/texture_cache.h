@@ -87,6 +87,11 @@ public:
         VideoOut,
     };
 
+    enum class ImageRange {
+        MatchAddress,
+        Contained,
+    };
+
     enum class DownloadMemoryFlags : u32 {
         None = 0,
         Sync = 1 << 0,
@@ -221,6 +226,10 @@ public:
 
     /// Retrieves image whose address matches provided
     [[nodiscard]] ImageId FindImageFromRange(VAddr address, size_t size, bool ensure_valid = true);
+
+    [[nodiscard]] SmallVector<ImageId, 4> FindImagesFromRange(
+        VAddr address, size_t size, ImageRange range = ImageRange::MatchAddress,
+        bool ensure_valid = true);
 
     /// Retrieves an image view with the properties of the specified image id.
     [[nodiscard]] vk::ImageView FindTexture(ImageId image_id, const ImageDesc& desc);
@@ -785,6 +794,7 @@ public:
 
 private:
     /// Removes image from the cache and schedules it for deletion.
+
     void FreeImage(ImageId image_id) {
         {
             std::scoped_lock lk{slot_images[image_id].mutex};

@@ -114,7 +114,7 @@ void PostProcessingPass::Create(vk::Device device, const vk::Format surface_form
         .depthClampEnable = false,
         .rasterizerDiscardEnable = false,
         .polygonMode = vk::PolygonMode::eFill,
-        .cullMode = vk::CullModeFlagBits::eBack,
+        .cullMode = vk::CullModeFlagBits::eNone,
         .frontFace = vk::FrontFace::eClockwise,
         .depthBiasEnable = false,
         .lineWidth = 1.0f,
@@ -237,10 +237,13 @@ void PostProcessingPass::Render(const CommandRecorder& cmdbuf, vk::ImageView inp
     // treat its last bound handle as unknown.
     VideoCore::Skipcache::Framework::Instance().BumpForeignPipelineGen(0);
 
+    const float viewport_height = static_cast<float>(frame.height) / settings.visible_height;
+    const float viewport_top = -(viewport_height - static_cast<float>(frame.height)) * 0.5f;
     const std::array viewports = {
         vk::Viewport{
-            .width = static_cast<float>(frame.width),
-            .height = static_cast<float>(frame.height),
+            .y = settings.flip_y ? viewport_top + viewport_height : viewport_top,
+            .width = static_cast<float>(frame.width) * (settings.left_half ? 2.0f : 1.0f),
+            .height = settings.flip_y ? -viewport_height : viewport_height,
             .minDepth = 0.0f,
             .maxDepth = 1.0f,
         },

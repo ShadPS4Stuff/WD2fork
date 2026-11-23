@@ -19,6 +19,9 @@ public:
         float gamma = 1.0f;
         u32 hdr = 0;
         u32 srgb_input = 0;
+        bool flip_y = false;
+        bool left_half = false;
+        float visible_height = 1.0f;
     };
 
     void Create(vk::Device device, vk::Format surface_format);

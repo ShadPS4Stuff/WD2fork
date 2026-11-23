@@ -15,6 +15,7 @@
 #include "common/logging/log.h"
 
 #include "core/emulator_settings.h"
+#include "common/debug.h"
 #include "shader_recompiler/resource.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -511,6 +512,7 @@ Pipeline::~Pipeline() {
 void Pipeline::BindResources(std::span<vk::WriteDescriptorSet> set_writes,
                              const Shader::PushData& push_data, u32 buffer_info_n,
                              u32 image_info_n) const {
+    RENDERER_TRACE;
     const auto cmdbuf = scheduler.CommandBuffer();
     const auto bind_point =
         IsCompute() ? vk::PipelineBindPoint::eCompute : vk::PipelineBindPoint::eGraphics;

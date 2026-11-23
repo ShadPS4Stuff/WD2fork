@@ -52,17 +52,20 @@ struct UniqueImage {
         : allocator{std::exchange(other.allocator, VK_NULL_HANDLE)},
           allocation{std::exchange(other.allocation, VK_NULL_HANDLE)},
           image{std::exchange(other.image, VK_NULL_HANDLE)}, image_ci{std::move(other.image_ci)},
-          size_bytes{std::exchange(other.size_bytes, 0)} {}
+          size_bytes{std::exchange(other.size_bytes, 0)},
+          memory_flags{std::exchange(other.memory_flags, {})} {}
     UniqueImage& operator=(UniqueImage&& other) {
         image = std::exchange(other.image, VK_NULL_HANDLE);
         allocator = std::exchange(other.allocator, VK_NULL_HANDLE);
         allocation = std::exchange(other.allocation, VK_NULL_HANDLE);
         image_ci = std::move(other.image_ci);
         size_bytes = std::exchange(other.size_bytes, 0);
+        memory_flags = std::exchange(other.memory_flags, {});
         return *this;
     }
 
-    void Create(const vk::ImageCreateInfo& image_ci);
+    void Create(const vk::ImageCreateInfo& image_ci, bool require_device_local = false,
+                bool dedicated = false);
 
     void Destroy();
 
@@ -81,6 +84,7 @@ public:
     vk::Image image{};
     vk::ImageCreateInfo image_ci{};
     vk::DeviceSize size_bytes{};
+    vk::MemoryPropertyFlags memory_flags{};
 };
 
 struct Image : public Common::LRUNode<> {

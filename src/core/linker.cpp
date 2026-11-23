@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2025-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
+
 #include "common/alignment.h"
 #include "common/arch.h"
 #include "common/assert.h"
@@ -485,8 +487,12 @@ void* Linker::TlsGetAddr(u64 module_index, u64 offset) {
     }
 
     u8* addr = dtv_table[module_index + 1].pointer;
-    Module* module = m_modules[module_index - 1].get();
     if (!addr) {
+        const auto it = std::ranges::find_if(m_modules, [module_index](const auto& entry) {
+            return entry->tls.modid == module_index;
+        });
+        ASSERT_MSG(it != m_modules.end(), "No module owns TLS index {}", module_index);
+        Module* module = it->get();
         // Module was just loaded by above code. Allocate TLS block for it.
         const u32 init_image_size = module->tls.init_image_size;
         u8* dest{};

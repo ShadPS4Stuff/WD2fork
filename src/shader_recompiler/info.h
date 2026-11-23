@@ -158,6 +158,7 @@ struct Info : InfoPersistent {
     bool uses_shader_clock{};
     bool uses_group_quad{};
     bool uses_group_shuffle{};
+    bool uses_group_clustered{};
     bool uses_group_ballot{};
     bool uses_fp16{};
     bool uses_fp64{};

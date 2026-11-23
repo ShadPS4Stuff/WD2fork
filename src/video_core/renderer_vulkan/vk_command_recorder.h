@@ -74,6 +74,8 @@ public:
 
     void beginRendering(const vk::RenderingInfo& rendering_info) const;
     void endRendering() const;
+    void beginQuery(vk::QueryPool query_pool, u32 query, vk::QueryControlFlags flags) const;
+    void endQuery(vk::QueryPool query_pool, u32 query) const;
     void draw(u32 vertex_count, u32 instance_count, u32 first_vertex, u32 first_instance) const;
     void drawIndexed(u32 index_count, u32 instance_count, u32 first_index, s32 vertex_offset,
                      u32 first_instance) const;

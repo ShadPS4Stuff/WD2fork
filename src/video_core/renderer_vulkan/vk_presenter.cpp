@@ -1,6 +1,8 @@
 // SPDX-FileCopyrightText: Copyright 2024-2026 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <mutex>
+#include <optional>
 #include "common/debug.h"
 #include "common/elf_info.h"
 #include "common/io_file.h"
@@ -10,6 +12,7 @@
 #include "core/devtools/layer.h"
 #include "core/emulator_settings.h"
 #include "core/libraries/system/systemservice.h"
+#include "core/libraries/vr_tracker/vr_tracker.h"
 #include "imgui/friends_layer.h"
 #include "imgui/invitation_prompt_layer.h"
 #include "imgui/notifications_layer.h"
@@ -490,6 +493,13 @@ Presenter::Presenter(Frontend::WindowSDL& window_, AmdGpu::Liverpool* liverpool_
     fsr_settings.rcas_attenuation =
         static_cast<float>(EmulatorSettings.GetRcasAttenuation() / 1000.f);
 
+    if (EmulatorSettings.IsPsvrOpenXr()) {
+        Libraries::VrTracker::PsvrXrSetVulkan(
+            static_cast<VkInstance>(instance.GetInstance()),
+            static_cast<VkPhysicalDevice>(instance.GetPhysicalDevice()),
+            static_cast<VkDevice>(device), instance.GetGraphicsQueueFamilyIndex(), 0);
+    }
+
     fsr_pass.Create(device, instance.GetAllocator(), num_images);
     pp_pass.Create(device, swapchain.GetSurfaceFormat().format);
 
@@ -513,6 +523,9 @@ Presenter::~Presenter() {
     Check(flip_scheduler.RawCommandBuffer().reset());
 
     const vk::Device device = instance.GetDevice();
+    if (xr_flip_image) {
+        vmaDestroyImage(instance.GetAllocator(), xr_flip_image, xr_flip_allocation);
+    }
     for (auto& frame : present_frames) {
         vmaDestroyImage(instance.GetAllocator(), frame.image, frame.allocation);
         device.destroyImageView(frame.image_view);
@@ -664,9 +677,196 @@ static vk::Format GetFrameViewFormat(const Libraries::VideoOut::PixelFormat form
     return {};
 }
 
+namespace {
+std::mutex g_psvr_eye_info_mutex;
+std::optional<VideoCore::ImageInfo> g_psvr_eye_info;
+VideoCore::ImageViewInfo g_psvr_eye_view;
+} // namespace
+
+void SetPsvrEyeImage(const VideoCore::ImageInfo& info, const VideoCore::ImageViewInfo& view) {
+    std::scoped_lock lk{g_psvr_eye_info_mutex};
+    g_psvr_eye_info = info;
+    g_psvr_eye_view = view;
+}
+
+static vk::Format SwapRedBlue(vk::Format format) {
+    switch (format) {
+    case vk::Format::eR8G8B8A8Srgb:
+        return vk::Format::eB8G8R8A8Srgb;
+    case vk::Format::eB8G8R8A8Srgb:
+        return vk::Format::eR8G8B8A8Srgb;
+    case vk::Format::eR8G8B8A8Unorm:
+        return vk::Format::eB8G8R8A8Unorm;
+    case vk::Format::eB8G8R8A8Unorm:
+        return vk::Format::eR8G8B8A8Unorm;
+    default:
+        return vk::Format::eUndefined;
+    }
+}
+
+bool Presenter::CopyPsvrEyeToHeadset(const CommandRecorder& cmdbuf, VideoCore::Image& image,
+                                     bool swap_rb) {
+    const vk::Format src_format = image.backing->image.image_ci.format;
+    const vk::Format dst_format = swap_rb ? SwapRedBlue(src_format) : src_format;
+    if (dst_format == vk::Format::eUndefined) {
+        LOG_ERROR(Render_Vulkan, "PSVR eye format {} has no headset equivalent",
+                  vk::to_string(src_format));
+        return false;
+    }
+    const u32 width = image.info.size.width;
+    const u32 height = image.info.size.height;
+
+    Libraries::VrTracker::PsvrXrImage target{};
+    if (!Libraries::VrTracker::PsvrXrBeginFrame(width, height, static_cast<s64>(dst_format),
+                                                target)) {
+        return true;
+    }
+
+    if (!xr_flip_image || xr_flip_extent != vk::Extent2D{width, height} ||
+        xr_flip_format != src_format) {
+        if (xr_flip_image) {
+            draw_scheduler.DeferPriorityOperation(
+                [allocator = instance.GetAllocator(), old_image = xr_flip_image,
+                 old_allocation = xr_flip_allocation] {
+                    vmaDestroyImage(allocator, old_image, old_allocation);
+                });
+            xr_flip_image = vk::Image{};
+        }
+        const VkImageCreateInfo image_info = static_cast<VkImageCreateInfo>(vk::ImageCreateInfo{
+            .imageType = vk::ImageType::e2D,
+            .format = src_format,
+            .extent = {width, height, 1},
+            .mipLevels = 1,
+            .arrayLayers = 1,
+            .samples = vk::SampleCountFlagBits::e1,
+            .usage = vk::ImageUsageFlagBits::eTransferDst | vk::ImageUsageFlagBits::eTransferSrc,
+        });
+        const VmaAllocationCreateInfo alloc_info = {
+            .usage = VMA_MEMORY_USAGE_AUTO_PREFER_DEVICE,
+        };
+        VkImage raw_image{};
+        if (vmaCreateImage(instance.GetAllocator(), &image_info, &alloc_info, &raw_image,
+                           &xr_flip_allocation, nullptr) != VK_SUCCESS) {
+            LOG_ERROR(Render_Vulkan, "Failed to create PSVR headset flip image");
+            return true;
+        }
+        xr_flip_image = vk::Image{raw_image};
+        xr_flip_extent = vk::Extent2D{width, height};
+        xr_flip_format = src_format;
+    }
+
+    const vk::Image swap_image{static_cast<VkImage>(target.image)};
+    const vk::ImageSubresourceRange range{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .baseMipLevel = 0,
+        .levelCount = 1,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+    const vk::ImageSubresourceLayers layers{
+        .aspectMask = vk::ImageAspectFlagBits::eColor,
+        .mipLevel = 0,
+        .baseArrayLayer = 0,
+        .layerCount = 1,
+    };
+
+    runtime.Transit(&image, vk::ImageLayout::eTransferSrcOptimal,
+                    vk::PipelineStageFlagBits2::eTransfer, vk::AccessFlagBits2::eTransferRead);
+    runtime.FlushBarriers();
+
+    const vk::ImageMemoryBarrier2 to_blit{
+        .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .srcAccessMask = vk::AccessFlagBits2::eNone,
+        .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .oldLayout = vk::ImageLayout::eUndefined,
+        .newLayout = vk::ImageLayout::eTransferDstOptimal,
+        .image = xr_flip_image,
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_blit,
+    });
+
+    const s32 w = static_cast<s32>(width);
+    const s32 h = static_cast<s32>(height);
+    const vk::ImageBlit blit{
+        .srcSubresource = layers,
+        .srcOffsets = std::array{vk::Offset3D{0, 0, 0}, vk::Offset3D{w, h, 1}},
+        .dstSubresource = layers,
+        .dstOffsets = std::array{vk::Offset3D{0, h, 0}, vk::Offset3D{w, 0, 1}},
+    };
+    draw_scheduler.Record([src = image.GetImage(), dst = xr_flip_image, blit](vk::CommandBuffer raw) {
+        raw.blitImage(src, vk::ImageLayout::eTransferSrcOptimal, dst,
+                      vk::ImageLayout::eTransferDstOptimal, blit, vk::Filter::eNearest);
+    });
+
+    const std::array to_copy{
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferRead,
+            .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+            .newLayout = vk::ImageLayout::eTransferSrcOptimal,
+            .image = xr_flip_image,
+            .subresourceRange = range,
+        },
+        vk::ImageMemoryBarrier2{
+            .srcStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+            .srcAccessMask = vk::AccessFlagBits2::eNone,
+            .dstStageMask = vk::PipelineStageFlagBits2::eTransfer,
+            .dstAccessMask = vk::AccessFlagBits2::eTransferWrite,
+            .oldLayout = vk::ImageLayout::eColorAttachmentOptimal,
+            .newLayout = vk::ImageLayout::eTransferDstOptimal,
+            .image = swap_image,
+            .subresourceRange = range,
+        },
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = static_cast<u32>(to_copy.size()),
+        .pImageMemoryBarriers = to_copy.data(),
+    });
+
+    const vk::ImageCopy copy{
+        .srcSubresource = layers,
+        .srcOffset = {0, 0, 0},
+        .dstSubresource = layers,
+        .dstOffset = {0, 0, 0},
+        .extent = {width, height, 1},
+    };
+    cmdbuf.copyImage(xr_flip_image, vk::ImageLayout::eTransferSrcOptimal, swap_image,
+                     vk::ImageLayout::eTransferDstOptimal, copy);
+
+    const vk::ImageMemoryBarrier2 to_headset{
+        .srcStageMask = vk::PipelineStageFlagBits2::eTransfer,
+        .srcAccessMask = vk::AccessFlagBits2::eTransferWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eAllCommands,
+        .dstAccessMask = vk::AccessFlagBits2::eNone,
+        .oldLayout = vk::ImageLayout::eTransferDstOptimal,
+        .newLayout = vk::ImageLayout::eColorAttachmentOptimal,
+        .image = swap_image,
+        .subresourceRange = range,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .imageMemoryBarrierCount = 1,
+        .pImageMemoryBarriers = &to_headset,
+    });
+    return true;
+}
+
 Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& attribute,
                                VAddr cpu_address) {
     auto desc = VideoCore::TextureCache::ImageDesc{attribute, cpu_address};
+    if (attribute.attrib.option == PsvrEyeFlipOption) {
+        std::scoped_lock lk{g_psvr_eye_info_mutex};
+        if (g_psvr_eye_info) {
+            desc = VideoCore::TextureCache::ImageDesc{};
+            desc.info = *g_psvr_eye_info;
+            desc.type = VideoCore::TextureCache::BindingType::RenderTarget;
+        }
+    }
     const auto image_id = texture_cache.FindImage(desc);
     texture_cache.UpdateImage(image_id);
 
@@ -700,13 +900,27 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
 
     VideoCore::ImageViewInfo view_info{};
     view_info.format = GetFrameViewFormat(attribute.attrib.pixel_format);
+    if (attribute.attrib.option == PsvrEyeFlipOption) {
+        std::scoped_lock lk{g_psvr_eye_info_mutex};
+        view_info.format = g_psvr_eye_view.format;
+        view_info.mapping = g_psvr_eye_view.mapping;
+        std::swap(view_info.mapping.r, view_info.mapping.b);
+    }
     // Exclude alpha from output frame to avoid blending with UI.
     view_info.mapping.a = AmdGpu::CompSwizzle::One;
 
     auto& image = texture_cache.GetImage(image_id);
     vk::ImageView image_view = image.FindViewHandle(view_info);
+    const bool headset_eye =
+        attribute.attrib.option == PsvrEyeFlipOption && EmulatorSettings.IsPsvrOpenXr();
+    if (headset_eye) {
+        CopyPsvrEyeToHeadset(cmdbuf, image, view_info.mapping.r == AmdGpu::CompSwizzle::Blue);
+    }
     const vk::Extent2D image_size = {image.info.size.width, image.info.size.height};
     expected_ratio = static_cast<float>(image_size.width) / static_cast<float>(image_size.height);
+    if (attribute.attrib.option == PsvrEyeFlipOption) {
+        expected_ratio = 16.0f / 9.0f;
+    }
 
     const u32 capture_game_only_count = VideoCore::ConsumeGameOnlyScreenshotRequests();
     std::optional<ScreenshotReadback> pending_screenshot;
@@ -748,6 +962,13 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     // the post process pass still sRGB encoded and has to be decoded there instead.
     pp_settings.srgb_input =
         attribute.attrib.pixel_format == Libraries::VideoOut::PixelFormat::A2R10G10B10Srgb;
+    pp_settings.flip_y = attribute.attrib.option == PsvrEyeFlipOption;
+    pp_settings.left_half = attribute.attrib.option == PsvrEyeFlipOption;
+    pp_settings.visible_height =
+        pp_settings.left_half
+            ? std::min(1.0f, static_cast<float>(image_size.width) * 0.5f * 9.0f / 16.0f /
+                                 static_cast<float>(image_size.height))
+            : 1.0f;
     pp_pass.Render(cmdbuf, image_view, image_size, *frame, pp_settings);
 
     DebugState.game_resolution = {image_size.width, image_size.height};
@@ -765,6 +986,9 @@ Frame* Presenter::PrepareFrame(const Libraries::VideoOut::BufferAttributeGroup& 
     frame->ready_tick = draw_scheduler.CurrentTick();
     SubmitInfo info{};
     draw_scheduler.Flush(info);
+    if (headset_eye) {
+        Libraries::VrTracker::PsvrXrEndFrame();
+    }
     return frame;
 }
 

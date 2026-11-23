@@ -537,6 +537,18 @@ void CommandRecorder::endRendering() const {
     scheduler->Record([](vk::CommandBuffer cmdbuf) { cmdbuf.endRendering(); });
 }
 
+void CommandRecorder::beginQuery(vk::QueryPool query_pool, u32 query,
+                                 vk::QueryControlFlags flags) const {
+    scheduler->Record([query_pool, query, flags](vk::CommandBuffer cmdbuf) {
+        cmdbuf.beginQuery(query_pool, query, flags);
+    });
+}
+
+void CommandRecorder::endQuery(vk::QueryPool query_pool, u32 query) const {
+    scheduler->Record(
+        [query_pool, query](vk::CommandBuffer cmdbuf) { cmdbuf.endQuery(query_pool, query); });
+}
+
 void CommandRecorder::draw(u32 vertex_count, u32 instance_count, u32 first_vertex,
                            u32 first_instance) const {
     scheduler->Record(

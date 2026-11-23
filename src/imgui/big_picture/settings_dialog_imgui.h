@@ -116,7 +116,8 @@ private:
     const std::vector<std::string> presentModeOptions = {"Mailbox", "Fifo", "Immediate"};
     const std::vector<std::string> hideCursorOptions = {"Never", "Idle", "Always"};
     const std::vector<std::string> trophySideOptions = {"left", "right", "top", "bottom"};
-    const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise"};
+    const std::vector<std::string> readbacksModeOptions = {"Disabled", "Relaxed", "Precise",
+                                                           "Precise (optimized)"};
     const std::vector<std::string> adaptiveSkipCachesOptions = {
         "Disabled", "Adaptive", "Validate only (slower - for testing)"};
 
@@ -146,6 +147,7 @@ private:
     bool gyroInvertXSetting;
     bool gyroInvertRollSetting;
     bool backgroundControllerSetting;
+    bool psvrEmuTestSetting;
     int cursorStateSetting;
     int cursorTimeoutSetting;
 

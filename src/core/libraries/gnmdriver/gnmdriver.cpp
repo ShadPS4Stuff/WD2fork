@@ -275,7 +275,12 @@ int PS4_SYSV_ABI sceGnmDebuggerWriteSqIndirectRegister() {
 }
 
 int PS4_SYSV_ABI sceGnmDebugHardwareStatus() {
-    LOG_ERROR(Lib_GnmDriver, "(STUBBED) called");
+    static std::atomic<u64> calls{0};
+    const u64 call = calls++;
+    if ((call & (call - 1)) == 0) {
+        LOG_ERROR(Lib_GnmDriver, "(STUBBED) called, call #{}", call + 1);
+        liverpool->LogQueueState();
+    }
     return ORBIS_OK;
 }
 
@@ -307,7 +312,9 @@ void PS4_SYSV_ABI sceGnmDingDong(u32 gnm_vqid, u32 next_offs_dw) {
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    if (!DebugState.skip_dingdong_idle_wait) {
+        WaitGpuIdle();
+    }
 
     if (DebugState.ShouldPauseInSubmit()) {
         DebugState.PauseGuestThreads();
@@ -2456,7 +2463,9 @@ s32 PS4_SYSV_ABI sceGnmSubmitCommandBuffersForWorkload(u32 workload, u32 count,
     }
 
     std::scoped_lock lk{m_submit_lock};
-    WaitGpuIdle();
+    if (!DebugState.skip_submit_idle_wait) {
+        WaitGpuIdle();
+    }
 
     return PerformSubmit(count, const_cast<const u32**>(dcb_gpu_addrs), dcb_sizes_in_bytes,
                          const_cast<const u32**>(ccb_gpu_addrs), ccb_sizes_in_bytes);

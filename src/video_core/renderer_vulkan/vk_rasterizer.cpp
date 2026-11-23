@@ -10,8 +10,11 @@
 #include "common/rdtsc.h"
 
 #include "common/debug.h"
+#include "common/io_file.h"
+#include "common/path_util.h"
 #include "core/debug_state.h"
 #include "core/emulator_settings.h"
+#include "core/libraries/videoout/video_out.h"
 #include "core/memory.h"
 #include "shader_recompiler/resource.h"
 #include "shader_recompiler/runtime_info.h"
@@ -24,14 +27,23 @@
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
+#include "video_core/renderer_vulkan/vk_presenter.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_runtime.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
 #include "video_core/renderer_vulkan/vk_shader_hle.h"
 #include "video_core/skipcache/skipcache.h"
+#include "video_core/renderer_vulkan/vk_shader_util.h"
 #include "video_core/texture_cache/image_view.h"
 #include "video_core/texture_cache/texture_cache.h"
 
+#include <chrono>
+#include <cmath>
+#include <cstring>
+#include <ctime>
+#include <thread>
+#include <sirit/sirit.h>
+#include <stb_image_write.h>
 #include <vulkan/vulkan_format_traits.hpp>
 
 namespace Vulkan {
@@ -199,6 +211,21 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
             [] { VideoCore::StreamCopyLane::Instance().DrainRemote(); });
     }
 
+    if (instance.IsHostQueryResetSupported()) {
+        const vk::QueryPoolCreateInfo pool_ci{
+            .queryType = vk::QueryType::eOcclusion,
+            .queryCount = ZpassPoolSize,
+        };
+        auto [pool_result, pool] = instance.GetDevice().createQueryPoolUnique(pool_ci);
+        if (pool_result == vk::Result::eSuccess) {
+            zpass_pool = std::move(pool);
+            instance.GetDevice().resetQueryPool(*zpass_pool, 0, ZpassPoolSize);
+            for (u32 slot = ZpassPoolSize; slot > 0; --slot) {
+                zpass_free_slots.push_back(slot - 1);
+            }
+        }
+    }
+
     scheduler.SetSubmitCallback([this](Vulkan::SubmitInfo& info) {
         runtime.FlushBarriers();
         // A packet still being bound records into the batch this submit opens.
@@ -230,6 +257,708 @@ void Rasterizer::BindPipelineDedup(vk::PipelineBindPoint point, vk::Pipeline han
     last_bound_pipeline_[idx] = handle;
     last_bound_pipeline_gen_[idx] = fgen;
     scheduler.CommandBuffer().bindPipeline(point, handle);
+}
+
+namespace {
+
+float HalfToFloat(u16 half) {
+    const u32 exponent = (half >> 10) & 0x1f;
+    const u32 mantissa = half & 0x3ff;
+    float value;
+    if (exponent == 0) {
+        value = std::ldexp(static_cast<float>(mantissa), -24);
+    } else if (exponent == 31) {
+        value = mantissa ? std::nanf("") : INFINITY;
+    } else {
+        value = std::ldexp(static_cast<float>(mantissa | 0x400), static_cast<int>(exponent) - 25);
+    }
+    return (half >> 15) ? -value : value;
+}
+
+float SmallUnsignedFloat(u32 bits, u32 mantissa_bits) {
+    const u32 exponent = (bits >> mantissa_bits) & 0x1f;
+    const u32 mantissa = bits & ((1u << mantissa_bits) - 1);
+    if (exponent == 0) {
+        return std::ldexp(static_cast<float>(mantissa), -14 - static_cast<int>(mantissa_bits));
+    }
+    if (exponent == 31) {
+        return mantissa ? std::nanf("") : INFINITY;
+    }
+    return std::ldexp(1.0f + static_cast<float>(mantissa) / static_cast<float>(1u << mantissa_bits),
+                      static_cast<int>(exponent) - 15);
+}
+
+u8 ToByte(float value) {
+    if (!(value > 0.0f)) {
+        return 0;
+    }
+    if (value >= 1.0f) {
+        return 255;
+    }
+    return static_cast<u8>(value * 255.0f + 0.5f);
+}
+
+bool ConvertCapturedPixels(vk::Format format, const u8* src, u32 width, u32 height,
+                           std::vector<u8>& rgba) {
+    const size_t count = static_cast<size_t>(width) * height;
+    rgba.assign(count * 4, 255);
+    const auto put = [&](size_t i, float r, float g, float b) {
+        rgba[i * 4 + 0] = ToByte(r);
+        rgba[i * 4 + 1] = ToByte(g);
+        rgba[i * 4 + 2] = ToByte(b);
+    };
+    const auto load32 = [&](size_t i) {
+        u32 value;
+        std::memcpy(&value, src + i * 4, sizeof(value));
+        return value;
+    };
+    const auto loadf = [&](size_t i) {
+        float value;
+        std::memcpy(&value, src + i * 4, sizeof(value));
+        return value;
+    };
+    const auto load16 = [&](size_t i) {
+        u16 value;
+        std::memcpy(&value, src + i * 2, sizeof(value));
+        return value;
+    };
+    switch (format) {
+    case vk::Format::eR8G8B8A8Unorm:
+    case vk::Format::eR8G8B8A8Srgb:
+        for (size_t i = 0; i < count; ++i) {
+            std::memcpy(&rgba[i * 4], src + i * 4, 3);
+        }
+        return true;
+    case vk::Format::eB8G8R8A8Unorm:
+    case vk::Format::eB8G8R8A8Srgb:
+        for (size_t i = 0; i < count; ++i) {
+            rgba[i * 4 + 0] = src[i * 4 + 2];
+            rgba[i * 4 + 1] = src[i * 4 + 1];
+            rgba[i * 4 + 2] = src[i * 4 + 0];
+        }
+        return true;
+    case vk::Format::eA2B10G10R10UnormPack32:
+        for (size_t i = 0; i < count; ++i) {
+            const u32 v = load32(i);
+            put(i, (v & 1023) / 1023.0f, ((v >> 10) & 1023) / 1023.0f,
+                ((v >> 20) & 1023) / 1023.0f);
+        }
+        return true;
+    case vk::Format::eA2R10G10B10UnormPack32:
+        for (size_t i = 0; i < count; ++i) {
+            const u32 v = load32(i);
+            put(i, ((v >> 20) & 1023) / 1023.0f, ((v >> 10) & 1023) / 1023.0f,
+                (v & 1023) / 1023.0f);
+        }
+        return true;
+    case vk::Format::eB10G11R11UfloatPack32:
+        for (size_t i = 0; i < count; ++i) {
+            const u32 v = load32(i);
+            put(i, SmallUnsignedFloat(v & 0x7ff, 6), SmallUnsignedFloat((v >> 11) & 0x7ff, 6),
+                SmallUnsignedFloat((v >> 22) & 0x3ff, 5));
+        }
+        return true;
+    case vk::Format::eR16G16B16A16Sfloat:
+        for (size_t i = 0; i < count; ++i) {
+            put(i, HalfToFloat(load16(i * 4 + 0)), HalfToFloat(load16(i * 4 + 1)),
+                HalfToFloat(load16(i * 4 + 2)));
+        }
+        return true;
+    case vk::Format::eR16G16B16A16Unorm:
+        for (size_t i = 0; i < count; ++i) {
+            put(i, load16(i * 4 + 0) / 65535.0f, load16(i * 4 + 1) / 65535.0f,
+                load16(i * 4 + 2) / 65535.0f);
+        }
+        return true;
+    case vk::Format::eR16G16Sfloat:
+        for (size_t i = 0; i < count; ++i) {
+            put(i, HalfToFloat(load16(i * 2 + 0)), HalfToFloat(load16(i * 2 + 1)), 0.0f);
+        }
+        return true;
+    case vk::Format::eR32G32B32A32Sfloat:
+        for (size_t i = 0; i < count; ++i) {
+            float r, g, b;
+            std::memcpy(&r, src + i * 16 + 0, 4);
+            std::memcpy(&g, src + i * 16 + 4, 4);
+            std::memcpy(&b, src + i * 16 + 8, 4);
+            put(i, r, g, b);
+        }
+        return true;
+    case vk::Format::eR8Unorm:
+        for (size_t i = 0; i < count; ++i) {
+            put(i, src[i] / 255.0f, src[i] / 255.0f, src[i] / 255.0f);
+        }
+        return true;
+    case vk::Format::eR8G8Unorm:
+        for (size_t i = 0; i < count; ++i) {
+            put(i, src[i * 2] / 255.0f, src[i * 2 + 1] / 255.0f, 0.0f);
+        }
+        return true;
+    case vk::Format::eR16Unorm:
+    case vk::Format::eD16Unorm:
+        for (size_t i = 0; i < count; ++i) {
+            const float v = load16(i) / 65535.0f;
+            put(i, v, v, v);
+        }
+        return true;
+    case vk::Format::eR16Sfloat:
+        for (size_t i = 0; i < count; ++i) {
+            const float v = HalfToFloat(load16(i));
+            put(i, v, v, v);
+        }
+        return true;
+    case vk::Format::eR32Sfloat:
+    case vk::Format::eD32Sfloat:
+    case vk::Format::eD32SfloatS8Uint:
+        for (size_t i = 0; i < count; ++i) {
+            const float v = loadf(i);
+            put(i, v, v, v);
+        }
+        return true;
+    default:
+        return false;
+    }
+}
+
+std::atomic<u32> pass_capture_writes_in_flight{0};
+
+void WritePassCapturePng(std::filesystem::path path, std::vector<u8> rgba, u32 width, u32 height) {
+    auto write = [path = std::move(path), rgba = std::move(rgba), width, height] {
+        Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
+        if (file.IsOpen()) {
+            auto callback = [](void* context, void* data, int size) {
+                static_cast<Common::FS::IOFile*>(context)->WriteRaw<u8>(data, size);
+            };
+            stbi_write_png_to_func(callback, &file, width, height, 4, rgba.data(), 0);
+        }
+        pass_capture_writes_in_flight.fetch_sub(1);
+    };
+    if (pass_capture_writes_in_flight.fetch_add(1) >= 8) {
+        write();
+    } else {
+        std::thread(std::move(write)).detach();
+    }
+}
+
+} // namespace
+
+void Rasterizer::StartPassCapture(u32 max_images, u32 min_size, u64 buffer_hash,
+                                  bool compute_only) {
+    pass_capture_dir = Common::FS::GetUserPath(Common::FS::PathType::ScreenshotsDir) /
+                       "passcapture" / fmt::format("capture_{}", std::time(nullptr));
+    std::filesystem::create_directories(pass_capture_dir);
+    pass_capture_sequence = 0;
+    pass_capture_min_size = min_size;
+    pass_capture_compute_only.store(compute_only, std::memory_order_relaxed);
+    capture_buffers.clear();
+    {
+        std::scoped_lock lock{pass_capture_mutex};
+        pass_capture_seen.clear();
+    }
+    pass_capture_buffer_hash.store(buffer_hash, std::memory_order_relaxed);
+    pass_capture_buffer_remaining.store(buffer_hash ? 64 : 0, std::memory_order_relaxed);
+    pass_capture_remaining.store(max_images, std::memory_order_release);
+    LOG_INFO(Render_Vulkan, "Pass capture started: {}", pass_capture_dir.string());
+}
+
+void Rasterizer::CapturePassBuffers(const Pipeline* pipeline) {
+    if (capture_buffers.empty()) {
+        return;
+    }
+    constexpr u64 MaxCapturedBufferSize = 16_MB;
+    const bool is_compute = pipeline->IsCompute();
+    const u64 hash = pass_capture_buffer_hash.load(std::memory_order_relaxed);
+    auto& staging_pool = runtime.GetStagingPool();
+    for (const CapturedBuffer& captured : capture_buffers) {
+        if (pass_capture_buffer_remaining.load(std::memory_order_relaxed) == 0) {
+            break;
+        }
+        const u64 size = std::min(captured.size, MaxCapturedBufferSize);
+        const auto download =
+            staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, true);
+        const std::array copy{vk::BufferCopy{
+            .srcOffset = captured.offset,
+            .dstOffset = download.offset,
+            .size = size,
+        }};
+        runtime.CopyBuffer(captured.buffer, download.buffer, copy);
+        pass_capture_buffer_remaining.fetch_sub(1, std::memory_order_relaxed);
+
+        auto path =
+            pass_capture_dir / fmt::format("{:05}_{}_{:08x}_buf{}_{:x}_{}.bin",
+                                           pass_capture_sequence++, is_compute ? "cs" : "draw",
+                                           hash, captured.binding, captured.address, size);
+        scheduler.DeferOperation([&staging_pool, download, size, path = std::move(path)] {
+            download.Invalidate();
+            Common::FS::IOFile file(path, Common::FS::FileAccessMode::Create);
+            if (file.IsOpen()) {
+                file.WriteRaw<u8>(download.mapped, size);
+            }
+            staging_pool.FreeDeferred(download);
+        });
+    }
+    capture_buffers.clear();
+}
+
+static std::vector<u32> BuildSampleCaptureShader() {
+    Sirit::Module module(0x00010300);
+    module.AddCapability(spv::Capability::Shader);
+    module.SetMemoryModel(spv::AddressingModel::Logical, spv::MemoryModel::GLSL450);
+
+    const Sirit::Id void_type = module.TypeVoid();
+    const Sirit::Id bool_type = module.TypeBool();
+    const Sirit::Id u32_type = module.TypeInt(32, false);
+    const Sirit::Id s32_type = module.TypeInt(32, true);
+    const Sirit::Id f32_type = module.TypeFloat(32);
+    const Sirit::Id uvec3_type = module.TypeVector(u32_type, 3);
+    const Sirit::Id ivec2_type = module.TypeVector(s32_type, 2);
+    const Sirit::Id vec4_type = module.TypeVector(f32_type, 4);
+    const Sirit::Id image_type =
+        module.TypeImage(f32_type, spv::Dim::Dim2D, 0, false, true, 1, spv::ImageFormat::Unknown);
+
+    const Sirit::Id image_var =
+        module.AddGlobalVariable(module.TypePointer(spv::StorageClass::UniformConstant, image_type),
+                                 spv::StorageClass::UniformConstant);
+    module.Decorate(image_var, spv::Decoration::DescriptorSet, 0u);
+    module.Decorate(image_var, spv::Decoration::Binding, 0u);
+
+    const Sirit::Id texel_array = module.TypeRuntimeArray(vec4_type);
+    module.Decorate(texel_array, spv::Decoration::ArrayStride, 16u);
+    const Sirit::Id texel_struct = module.TypeStruct(texel_array);
+    module.Decorate(texel_struct, spv::Decoration::Block);
+    module.MemberDecorate(texel_struct, 0u, spv::Decoration::Offset, 0u);
+    const Sirit::Id texel_var =
+        module.AddGlobalVariable(module.TypePointer(spv::StorageClass::StorageBuffer, texel_struct),
+                                 spv::StorageClass::StorageBuffer);
+    module.Decorate(texel_var, spv::Decoration::DescriptorSet, 0u);
+    module.Decorate(texel_var, spv::Decoration::Binding, 1u);
+
+    const Sirit::Id push_struct = module.TypeStruct(u32_type, u32_type, u32_type);
+    module.Decorate(push_struct, spv::Decoration::Block);
+    module.MemberDecorate(push_struct, 0u, spv::Decoration::Offset, 0u);
+    module.MemberDecorate(push_struct, 1u, spv::Decoration::Offset, 4u);
+    module.MemberDecorate(push_struct, 2u, spv::Decoration::Offset, 8u);
+    const Sirit::Id push_var =
+        module.AddGlobalVariable(module.TypePointer(spv::StorageClass::PushConstant, push_struct),
+                                 spv::StorageClass::PushConstant);
+
+    const Sirit::Id invocation_var = module.AddGlobalVariable(
+        module.TypePointer(spv::StorageClass::Input, uvec3_type), spv::StorageClass::Input);
+    module.Decorate(invocation_var, spv::Decoration::BuiltIn, spv::BuiltIn::GlobalInvocationId);
+
+    const Sirit::Id zero = module.Constant(u32_type, 0u);
+    const Sirit::Id one = module.Constant(u32_type, 1u);
+    const Sirit::Id two = module.Constant(u32_type, 2u);
+    const Sirit::Id push_u32_ptr = module.TypePointer(spv::StorageClass::PushConstant, u32_type);
+    const Sirit::Id texel_ptr = module.TypePointer(spv::StorageClass::StorageBuffer, vec4_type);
+
+    const Sirit::Id main = module.OpFunction(void_type, spv::FunctionControlMask::MaskNone,
+                                             module.TypeFunction(void_type));
+    module.AddLabel();
+    const Sirit::Id invocation = module.OpLoad(uvec3_type, invocation_var);
+    const Sirit::Id x = module.OpCompositeExtract(u32_type, invocation, 0u);
+    const Sirit::Id y = module.OpCompositeExtract(u32_type, invocation, 1u);
+    const Sirit::Id sample = module.OpCompositeExtract(u32_type, invocation, 2u);
+    const Sirit::Id width =
+        module.OpLoad(u32_type, module.OpAccessChain(push_u32_ptr, push_var, zero));
+    const Sirit::Id height =
+        module.OpLoad(u32_type, module.OpAccessChain(push_u32_ptr, push_var, one));
+    const Sirit::Id num_samples =
+        module.OpLoad(u32_type, module.OpAccessChain(push_u32_ptr, push_var, two));
+    const Sirit::Id inside = module.OpLogicalAnd(bool_type, module.OpULessThan(bool_type, x, width),
+                                                 module.OpULessThan(bool_type, y, height));
+    const Sirit::Id body = module.OpLabel();
+    const Sirit::Id merge = module.OpLabel();
+    module.OpSelectionMerge(merge, spv::SelectionControlMask::MaskNone);
+    module.OpBranchConditional(inside, body, merge);
+
+    module.AddLabel(body);
+    const Sirit::Id image = module.OpLoad(image_type, image_var);
+    const Sirit::Id coord = module.OpCompositeConstruct(
+        ivec2_type, std::array{module.OpBitcast(s32_type, x), module.OpBitcast(s32_type, y)});
+    const Sirit::Id texel =
+        module.OpImageFetch(vec4_type, image, coord, spv::ImageOperandsMask::Sample,
+                            module.OpBitcast(s32_type, sample));
+    const Sirit::Id row = module.OpIMul(u32_type, y, module.OpIMul(u32_type, width, num_samples));
+    const Sirit::Id column = module.OpIAdd(u32_type, module.OpIMul(u32_type, sample, width), x);
+    const Sirit::Id index = module.OpIAdd(u32_type, row, column);
+    module.OpStore(module.OpAccessChain(texel_ptr, texel_var, zero, index), texel);
+    module.OpBranch(merge);
+
+    module.AddLabel(merge);
+    module.OpReturn();
+    module.OpFunctionEnd();
+
+    module.AddEntryPoint(spv::ExecutionModel::GLCompute, main, "main", invocation_var);
+    module.AddExecutionMode(main, spv::ExecutionMode::LocalSize, 8u, 8u, 1u);
+    return module.Assemble();
+}
+
+void Rasterizer::EnsureSampleCapturePipeline() {
+    if (sample_capture_pipeline) {
+        return;
+    }
+    const auto device = instance.GetDevice();
+    const std::array<vk::DescriptorSetLayoutBinding, 2> bindings = {{
+        {
+            .binding = 0,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+        {
+            .binding = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .descriptorCount = 1,
+            .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        },
+    }};
+    const vk::DescriptorSetLayoutCreateInfo set_layout_ci = {
+        .flags = vk::DescriptorSetLayoutCreateFlagBits::ePushDescriptorKHR,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
+    };
+    auto [set_layout_result, set_layout] = device.createDescriptorSetLayoutUnique(set_layout_ci);
+    ASSERT(set_layout_result == vk::Result::eSuccess);
+    sample_capture_set_layout = std::move(set_layout);
+
+    const vk::PushConstantRange push_range = {
+        .stageFlags = vk::ShaderStageFlagBits::eCompute,
+        .offset = 0,
+        .size = 3 * sizeof(u32),
+    };
+    const vk::DescriptorSetLayout set_layout_handle = *sample_capture_set_layout;
+    const vk::PipelineLayoutCreateInfo layout_ci = {
+        .setLayoutCount = 1,
+        .pSetLayouts = &set_layout_handle,
+        .pushConstantRangeCount = 1,
+        .pPushConstantRanges = &push_range,
+    };
+    auto [layout_result, layout] = device.createPipelineLayoutUnique(layout_ci);
+    ASSERT(layout_result == vk::Result::eSuccess);
+    sample_capture_layout = std::move(layout);
+
+    const auto code = BuildSampleCaptureShader();
+    const auto module = Vulkan::CompileSPV(code, device);
+    const vk::ComputePipelineCreateInfo pipeline_ci = {
+        .stage{
+            .stage = vk::ShaderStageFlagBits::eCompute,
+            .module = module,
+            .pName = "main",
+        },
+        .layout = *sample_capture_layout,
+    };
+    auto [pipeline_result, pipeline] =
+        device.createComputePipelineUnique(VK_NULL_HANDLE, pipeline_ci);
+    ASSERT(pipeline_result == vk::Result::eSuccess);
+    sample_capture_pipeline = std::move(pipeline);
+    device.destroyShaderModule(module);
+}
+
+void Rasterizer::CaptureSamples(VideoCore::Image& image, std::filesystem::path path) {
+    EnsureSampleCapturePipeline();
+    const auto device = instance.GetDevice();
+    const u32 width = image.info.size.width;
+    const u32 height = image.info.size.height;
+    const u32 num_samples = static_cast<u32>(image.backing->image.image_ci.samples);
+    const bool depth = image.info.props.is_depth;
+
+    const vk::ImageViewUsageCreateInfo view_usage = {.usage = vk::ImageUsageFlagBits::eSampled};
+    const vk::ImageViewCreateInfo view_ci = {
+        .pNext = &view_usage,
+        .image = image.GetImage(),
+        .viewType = vk::ImageViewType::e2D,
+        .format = image.info.pixel_format,
+        .subresourceRange{
+            .aspectMask = depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+            .baseMipLevel = 0,
+            .levelCount = 1,
+            .baseArrayLayer = 0,
+            .layerCount = 1,
+        },
+    };
+    const auto [view_result, view] = device.createImageView(view_ci);
+    if (view_result != vk::Result::eSuccess) {
+        LOG_WARNING(Render_Vulkan, "Pass capture: can't view samples of {}",
+                    path.filename().string());
+        return;
+    }
+
+    auto& staging_pool = runtime.GetStagingPool();
+    const u64 size = u64(width) * height * num_samples * 16;
+    const auto download = staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, true);
+
+    scheduler.EndRendering();
+    runtime.Transit(&image, vk::ImageLayout::eGeneral, vk::PipelineStageFlagBits2::eComputeShader,
+                    vk::AccessFlagBits2::eShaderRead);
+    runtime.FlushBarriers();
+
+    const auto cmdbuf = scheduler.CommandBuffer();
+    cmdbuf.bindPipeline(vk::PipelineBindPoint::eCompute, *sample_capture_pipeline);
+    const vk::DescriptorImageInfo image_info = {
+        .imageView = view,
+        .imageLayout = vk::ImageLayout::eGeneral,
+    };
+    const vk::DescriptorBufferInfo buffer_info = {
+        .buffer = download.buffer->Handle(),
+        .offset = download.offset,
+        .range = size,
+    };
+    const std::array<vk::WriteDescriptorSet, 2> writes = {{
+        {
+            .dstBinding = 0,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eSampledImage,
+            .pImageInfo = &image_info,
+        },
+        {
+            .dstBinding = 1,
+            .descriptorCount = 1,
+            .descriptorType = vk::DescriptorType::eStorageBuffer,
+            .pBufferInfo = &buffer_info,
+        },
+    }};
+    cmdbuf.pushDescriptorSetKHR(vk::PipelineBindPoint::eCompute, *sample_capture_layout, 0, writes);
+    const std::array<u32, 3> push = {width, height, num_samples};
+    cmdbuf.pushConstants(*sample_capture_layout, vk::ShaderStageFlagBits::eCompute, 0, sizeof(push),
+                         push.data());
+    cmdbuf.dispatch((width + 7) / 8, (height + 7) / 8, num_samples);
+
+    const vk::MemoryBarrier2 to_host = {
+        .srcStageMask = vk::PipelineStageFlagBits2::eComputeShader,
+        .srcAccessMask = vk::AccessFlagBits2::eShaderWrite,
+        .dstStageMask = vk::PipelineStageFlagBits2::eHost,
+        .dstAccessMask = vk::AccessFlagBits2::eHostRead,
+    };
+    cmdbuf.pipelineBarrier2(vk::DependencyInfo{
+        .memoryBarrierCount = 1,
+        .pMemoryBarriers = &to_host,
+    });
+
+    const u32 out_width = width * num_samples;
+    scheduler.DeferOperation([&staging_pool, device, view, download, depth, out_width, height,
+                              path = std::move(path)]() mutable {
+        device.destroyImageView(view);
+        download.Invalidate();
+        const auto* texels = reinterpret_cast<const float*>(download.mapped);
+        const size_t count = size_t(out_width) * height;
+        float lo = 1.0f;
+        float hi = 0.0f;
+        if (depth) {
+            for (size_t i = 0; i < count; ++i) {
+                const float v = texels[i * 4];
+                if (v < 1.0f) {
+                    lo = std::min(lo, v);
+                    hi = std::max(hi, v);
+                }
+            }
+        }
+        const float range = hi > lo ? hi - lo : 1.0f;
+        std::vector<u8> rgba(count * 4);
+        for (size_t i = 0; i < count; ++i) {
+            for (u32 c = 0; c < 3; ++c) {
+                float v = depth ? (texels[i * 4] - lo) / range : texels[i * 4 + c];
+                v = std::clamp(std::isfinite(v) ? v : 0.0f, 0.0f, 1.0f);
+                rgba[i * 4 + c] = static_cast<u8>(v * 255.0f + 0.5f);
+            }
+            rgba[i * 4 + 3] = 255;
+        }
+        staging_pool.FreeDeferred(download);
+        WritePassCapturePng(std::move(path), std::move(rgba), out_width, height);
+    });
+}
+
+void Rasterizer::CapturePassImages(const Pipeline* pipeline) {
+    RENDERER_TRACE;
+    CapturePassBuffers(pipeline);
+    if (pass_capture_remaining.load(std::memory_order_acquire) == 0) {
+        return;
+    }
+    const bool is_compute = pipeline->IsCompute();
+    const auto& target0 = liverpool->regs.color_buffers[0];
+    const auto& depth_control = liverpool->regs.depth_control;
+    const bool float_target =
+        (target0 && (target0.GetDataFmt() == AmdGpu::DataFormat::Format16_16_16_16 ||
+                     (depth_control.stencil_enable && !depth_control.depth_write_enable))) ||
+        (depth_control.depth_enable && depth_control.depth_write_enable &&
+         liverpool->regs.depth_buffer.NumSamples() > 1);
+    if (!is_compute && !float_target && pass_capture_compute_only.load(std::memory_order_relaxed)) {
+        return;
+    }
+    u64 hash = 0;
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        if (stage) {
+            hash = stage->pgm_hash;
+        }
+    }
+    if (const Shader::Info* fragment = pipeline->GetStages().front(); !is_compute && fragment) {
+        hash = fragment->pgm_hash;
+    }
+    if (!is_compute) {
+        bool first_seen;
+        {
+            std::scoped_lock lock{pass_capture_mutex};
+            first_seen = pass_capture_seen.emplace(hash, 0).second;
+        }
+        if (first_seen) {
+            const auto& regs = liverpool->regs;
+            const auto scissor = regs.GetCombinedScissor();
+            LOG_INFO(Render_Vulkan,
+                     "[DRAWINFO] ps={:#x} prim={} indices={} instances={} scissor=({},{})-({},{}) "
+                     "mrt_mask={:#x} rt0={:#x} depth_en={} depth_write={} depth_func={} "
+                     "stencil_en={} stencil_func={} blend_en={} src={} dst={} func={} z={:#x} "
+                     "stencil={:#x}",
+                     hash, static_cast<u32>(regs.primitive_type), regs.num_indices,
+                     regs.num_instances.NumInstances(), scissor.top_left_x, scissor.top_left_y,
+                     scissor.bottom_right_x, scissor.bottom_right_y,
+                     static_cast<u32>(regs.color_target_mask.raw), target0 ? target0.Address() : 0,
+                     u32(regs.depth_control.depth_enable),
+                     u32(regs.depth_control.depth_write_enable),
+                     static_cast<u32>(regs.depth_control.depth_func),
+                     u32(regs.depth_control.stencil_enable),
+                     static_cast<u32>(regs.depth_control.stencil_ref_func),
+                     u32(regs.blend_control[0].enable),
+                     static_cast<u32>(regs.blend_control[0].color_src_factor),
+                     static_cast<u32>(regs.blend_control[0].color_dst_factor),
+                     static_cast<u32>(regs.blend_control[0].color_func),
+                     regs.depth_buffer.DepthAddress(), regs.depth_buffer.StencilAddress());
+        }
+    }
+    auto& staging_pool = runtime.GetStagingPool();
+    for (const VideoCore::ImageId image_id : bound_images) {
+        if (pass_capture_remaining.load(std::memory_order_relaxed) == 0) {
+            break;
+        }
+        auto& image = texture_cache.GetImage(image_id);
+        {
+            std::scoped_lock lock{pass_capture_mutex};
+            if (pass_capture_seen.emplace(hash, image.info.guest_address | (1ULL << 63)).second) {
+                LOG_INFO(Render_Vulkan,
+                         "[BOUND] {}={:#x} {:#x}+{:#x} {}x{} {} samples={} tile={} mips={} "
+                         "layers={} rt={} depth={} storage={} flags={:#x}",
+                         is_compute ? "cs" : "ps", hash, image.info.guest_address,
+                         image.info.guest_size, image.info.size.width, image.info.size.height,
+                         vk::to_string(image.info.pixel_format), image.info.num_samples,
+                         static_cast<u32>(image.info.tile_mode), image.info.resources.levels,
+                         image.info.resources.layers, u32(image.usage.render_target),
+                         u32(image.usage.depth_target), u32(image.usage.storage),
+                         static_cast<u32>(image.flags));
+            }
+        }
+        const u64 inputs_hash = pass_capture_buffer_hash.load(std::memory_order_relaxed);
+        const bool written = (inputs_hash != 0 && hash == inputs_hash) ||
+                             (is_compute ? image.usage.storage
+                                         : (image.usage.render_target || image.usage.depth_target));
+        const u32 width = image.info.size.width;
+        const u32 height = image.info.size.height;
+        const bool multisampled =
+            image.info.num_samples > 1 &&
+            image.backing->image.image_ci.samples != vk::SampleCountFlagBits::e1;
+        if (!(written || multisampled) || image.info.props.is_block ||
+            (image.info.num_samples > 1 && !multisampled) || width < pass_capture_min_size ||
+            height < pass_capture_min_size) {
+            continue;
+        }
+        {
+            std::scoped_lock lock{pass_capture_mutex};
+            if (!pass_capture_seen.emplace(hash, image.info.guest_address).second) {
+                continue;
+            }
+        }
+        if (multisampled) {
+            const u32 samples = static_cast<u32>(image.backing->image.image_ci.samples);
+            pass_capture_remaining.fetch_sub(1, std::memory_order_relaxed);
+            CaptureSamples(image,
+                           pass_capture_dir /
+                               fmt::format("{:05}_{}_{:08x}_{:x}_{}x{}_{}_{}samples.png",
+                                           pass_capture_sequence++, is_compute ? "cs" : "draw",
+                                           hash, image.info.guest_address, width, height,
+                                           vk::to_string(image.info.pixel_format), samples));
+            continue;
+        }
+        const vk::Format format = image.info.pixel_format;
+        const bool depth = image.info.props.is_depth;
+        const u32 bytes_per_pixel = depth ? (format == vk::Format::eD16Unorm ? 2u : 4u)
+                                          : static_cast<u32>(vk::blockSize(format));
+        const u64 size = static_cast<u64>(width) * height * std::max(bytes_per_pixel, 4u);
+        const auto download =
+            staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, true);
+        const vk::BufferImageCopy copy{
+            .bufferOffset = download.offset,
+            .bufferRowLength = 0,
+            .bufferImageHeight = 0,
+            .imageSubresource{
+                .aspectMask =
+                    depth ? vk::ImageAspectFlagBits::eDepth : vk::ImageAspectFlagBits::eColor,
+                .mipLevel = 0,
+                .baseArrayLayer = 0,
+                .layerCount = 1,
+            },
+            .imageOffset = {0, 0, 0},
+            .imageExtent = {width, height, 1},
+        };
+        runtime.DownloadImage(&image, download.buffer, std::array{copy});
+        pass_capture_remaining.fetch_sub(1, std::memory_order_relaxed);
+
+        auto path = pass_capture_dir /
+                    fmt::format("{:05}_{}_{:08x}_{:x}_{}x{}_{}.png", pass_capture_sequence++,
+                                is_compute ? "cs" : "draw", hash, image.info.guest_address, width,
+                                height, vk::to_string(format));
+        scheduler.DeferOperation(
+            [&staging_pool, download, format, width, height, path = std::move(path)]() mutable {
+                download.Invalidate();
+                std::vector<u8> rgba;
+                const bool converted =
+                    ConvertCapturedPixels(format, download.mapped, width, height, rgba);
+                staging_pool.FreeDeferred(download);
+                if (!converted) {
+                    LOG_WARNING(Render_Vulkan, "Pass capture: unsupported format {} for {}",
+                                vk::to_string(format), path.filename().string());
+                    return;
+                }
+                WritePassCapturePng(std::move(path), std::move(rgba), width, height);
+            });
+    }
+}
+
+bool Rasterizer::ShouldSkipPipeline(const Pipeline* pipeline) {
+    RENDERER_TRACE;
+    std::scoped_lock lock{shader_skip_mutex};
+    bool skip = false;
+    for (const Shader::Info* stage : pipeline->GetStages()) {
+        if (!stage) {
+            continue;
+        }
+        auto [it, inserted] = shader_skip_entries.try_emplace(
+            stage->pgm_hash, ShaderSkipEntry{stage->pgm_hash, stage->sw_stage, 0, false});
+        ++it->second.count;
+        skip |= it->second.skipped;
+    }
+    return skip;
+}
+
+std::vector<Rasterizer::ShaderSkipEntry> Rasterizer::GetShaderSkipEntries() const {
+    std::scoped_lock lock{shader_skip_mutex};
+    std::vector<ShaderSkipEntry> entries;
+    entries.reserve(shader_skip_entries.size());
+    for (const auto& [hash, entry] : shader_skip_entries) {
+        entries.push_back(entry);
+    }
+    return entries;
+}
+
+void Rasterizer::SetShaderSkipped(u64 hash, bool skipped) {
+    std::scoped_lock lock{shader_skip_mutex};
+    if (const auto it = shader_skip_entries.find(hash); it != shader_skip_entries.end()) {
+        it->second.skipped = skipped;
+    }
+}
+
+void Rasterizer::ClearShaderSkips() {
+    std::scoped_lock lock{shader_skip_mutex};
+    for (auto& [hash, entry] : shader_skip_entries) {
+        entry.skipped = false;
+    }
 }
 
 bool Rasterizer::FilterDraw() {
@@ -519,6 +1248,14 @@ bool Rasterizer::PrepareRenderState(const GraphicsPipeline* pipeline) {
         image_id = bound_images.emplace_back(texture_cache.FindImage(desc));
         auto& image = texture_cache.GetImage(image_id);
         image.binding.is_target = 1u;
+        if (EmulatorSettings.IsPsvrEmuTest()) {
+            if (image.info.size.width * image.info.size.height > 1920u * 1080u * 3u / 2u) {
+                Libraries::VideoOut::SetPsvrEyeTarget(image.info.guest_address,
+                                                      image.info.size.width,
+                                                      image.info.size.height, image.info.pitch);
+                Vulkan::SetPsvrEyeImage(image.info, desc.view_info);
+            }
+        }
     }
 
     if ((regs.depth_control.depth_enable && regs.depth_buffer.DepthValid()) ||
@@ -586,6 +1323,190 @@ void Rasterizer::EliminateFastClear() {
     ScopeMarkerEnd();
 }
 
+static constexpr u64 ZpassValidMask = 0x8000000000000000ULL;
+static constexpr u64 ZpassFallbackStep = 0x2FFFFFFULL;
+
+void Rasterizer::ResetZpass() {
+    FlushZpassWindow(std::nullopt);
+}
+
+void Rasterizer::ToggleZpassCounting() {
+    zpass_counting = !zpass_counting;
+}
+
+void Rasterizer::DumpZpass(VAddr address, u32 num_counter_pairs) {
+    FlushZpassWindow(std::pair{address, num_counter_pairs});
+}
+
+std::optional<u32> Rasterizer::BeginZpassQuery(const CommandRecorder& cmdbuf) {
+    if (!zpass_counting && !predication_force_counting) {
+        return std::nullopt;
+    }
+    std::scoped_lock lock{zpass_mutex};
+    if (zpass_free_slots.empty()) {
+        return std::nullopt;
+    }
+    const u32 slot = zpass_free_slots.back();
+    zpass_free_slots.pop_back();
+    cmdbuf.beginQuery(*zpass_pool, slot, {});
+    return slot;
+}
+
+void Rasterizer::EndZpassQuery(const CommandRecorder& cmdbuf, std::optional<u32> slot) {
+    if (!slot) {
+        return;
+    }
+    cmdbuf.endQuery(*zpass_pool, *slot);
+    zpass_active.push_back(*slot);
+    zpass_queries.fetch_add(1, std::memory_order_relaxed);
+}
+
+void Rasterizer::FlushZpassWindow(std::optional<std::pair<VAddr, u32>> dump) {
+    auto queries = std::move(zpass_active);
+    zpass_active.clear();
+    const bool inexact = std::exchange(zpass_draws, 0u) != queries.size();
+    if (dump) {
+        zpass_dumps.fetch_add(1, std::memory_order_relaxed);
+        if (inexact) {
+            zpass_inexact.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+    if (!zpass_pool) {
+        if (dump && memory->IsValidMapping(dump->first, u64(dump->second) * sizeof(u64) * 2)) {
+            std::scoped_lock lock{zpass_mutex};
+            zpass_counter += ZpassFallbackStep;
+            const u64 value = zpass_counter | ZpassValidMask;
+            for (u32 i = 0; i < dump->second; ++i) {
+                std::memcpy(reinterpret_cast<void*>(dump->first + i * sizeof(u64) * 2), &value,
+                            sizeof(value));
+            }
+        }
+        return;
+    }
+    if (queries.empty() && !dump) {
+        return;
+    }
+    zpass_dump_pending |= dump.has_value();
+    scheduler.DeferPriorityOperation([this, queries = std::move(queries), inexact, dump] {
+        const auto device = instance.GetDevice();
+        std::scoped_lock lock{zpass_mutex};
+        u64 samples = inexact ? 1 : 0;
+        for (const u32 slot : queries) {
+            u64 value{};
+            const auto result = device.getQueryPoolResults(
+                *zpass_pool, slot, 1, sizeof(value), &value, sizeof(value),
+                vk::QueryResultFlagBits::e64 | vk::QueryResultFlagBits::eWait);
+            samples += result == vk::Result::eSuccess ? value : 1;
+            device.resetQueryPool(*zpass_pool, slot, 1);
+            zpass_free_slots.push_back(slot);
+        }
+        if (!dump) {
+            return;
+        }
+        zpass_counter += samples;
+        const auto [address, num_counter_pairs] = *dump;
+        const u64 counter = zpass_counter | ZpassValidMask;
+        if (!memory->IsValidMapping(address, u64(num_counter_pairs) * sizeof(u64) * 2)) {
+            return;
+        }
+        for (u32 i = 0; i < num_counter_pairs; ++i) {
+            auto* dst = reinterpret_cast<void*>(address + i * sizeof(u64) * 2);
+            if (!memory->TryWriteBacking(dst, &counter, sizeof(counter))) {
+                std::memcpy(dst, &counter, sizeof(counter));
+            }
+        }
+    });
+}
+
+bool Rasterizer::EvaluateZpassPredicate(VAddr address, u32 num_counter_pairs, bool draw_visible) {
+    const auto visible = ReadZpassVisibility(address, num_counter_pairs);
+    bool skip = visible && *visible != draw_visible;
+    const auto mode = static_cast<PredicationDebugMode>(predication_mode.load());
+    if (mode == PredicationDebugMode::NeverCull) {
+        skip = false;
+    } else if (mode == PredicationDebugMode::AlwaysCull) {
+        skip = true;
+    }
+    pred_packets.fetch_add(1, std::memory_order_relaxed);
+    (skip ? pred_culled : pred_drawn).fetch_add(1, std::memory_order_relaxed);
+    if (!visible) {
+        pred_unknown.fetch_add(1, std::memory_order_relaxed);
+    }
+    std::scoped_lock lock{pred_mutex};
+    pred_decisions[pred_decision_count++ % pred_decisions.size()] = PredicationDecision{
+        .address = address,
+        .state = static_cast<u8>(!visible   ? 0
+                                 : *visible ? 1
+                                            : 2),
+        .draw_visible = draw_visible,
+        .skipped = skip,
+    };
+    return skip;
+}
+
+void Rasterizer::NotePredicatedPacketSkipped() {
+    pred_skipped_packets.fetch_add(1, std::memory_order_relaxed);
+}
+
+Rasterizer::PredicationStats Rasterizer::GetPredicationStats() const {
+    PredicationStats stats{
+        .packets = pred_packets,
+        .culled = pred_culled,
+        .drawn = pred_drawn,
+        .unknown = pred_unknown,
+        .skipped_packets = pred_skipped_packets,
+        .dumps = zpass_dumps,
+        .inexact_windows = zpass_inexact,
+        .queries = zpass_queries,
+        .free_slots = 0,
+        .counting = zpass_counting || predication_force_counting,
+    };
+    std::scoped_lock lock{zpass_mutex};
+    stats.free_slots = static_cast<u32>(zpass_free_slots.size());
+    return stats;
+}
+
+std::vector<Rasterizer::PredicationDecision> Rasterizer::GetPredicationDecisions() const {
+    std::scoped_lock lock{pred_mutex};
+    std::vector<PredicationDecision> result;
+    const u32 count = std::min<u32>(pred_decision_count, pred_decisions.size());
+    for (u32 i = 0; i < count; ++i) {
+        result.push_back(pred_decisions[(pred_decision_count - 1 - i) % pred_decisions.size()]);
+    }
+    return result;
+}
+
+void Rasterizer::ResetPredicationStats() {
+    pred_packets = 0;
+    pred_culled = 0;
+    pred_drawn = 0;
+    pred_unknown = 0;
+    pred_skipped_packets = 0;
+    zpass_dumps = 0;
+    zpass_inexact = 0;
+    zpass_queries = 0;
+    std::scoped_lock lock{pred_mutex};
+    pred_decision_count = 0;
+}
+
+std::optional<bool> Rasterizer::ReadZpassVisibility(VAddr address, u32 num_counter_pairs) const {
+    if (address == 0 ||
+        !memory->IsValidMapping(address, u64(num_counter_pairs) * sizeof(u64) * 2)) {
+        return std::nullopt;
+    }
+    const auto* results = reinterpret_cast<const u64*>(address);
+    bool visible = false;
+    for (u32 i = 0; i < num_counter_pairs; ++i) {
+        const u64 begin = results[i * 2];
+        const u64 end = results[i * 2 + 1];
+        if ((begin & end & ZpassValidMask) == 0) {
+            return std::nullopt;
+        }
+        visible |= (begin & ~ZpassValidMask) != (end & ~ZpassValidMask);
+    }
+    return visible;
+}
+
 void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     RENDERER_TRACE;
 
@@ -596,10 +1517,11 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     if (!FilterDraw()) {
         return;
     }
+    ++zpass_draws;
 
     const auto& regs = liverpool->regs;
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline();
-    if (!pipeline) {
+    if (!pipeline || ShouldSkipPipeline(pipeline)) {
         return;
     }
     if (Gr2Fsr3::OnDraw(*pipeline, *liverpool, *this, false)) {
@@ -704,6 +1626,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
     const auto cmdbuf = scheduler.CommandBuffer();
     BindPipelineDedup(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    const auto zpass_query = BeginZpassQuery(cmdbuf);
     if (is_indexed) {
         cmdbuf.drawIndexed(regs.num_indices, regs.num_instances.NumInstances(), first_index,
                            s32(vertex_offset), instance_offset);
@@ -711,8 +1634,10 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset) {
         cmdbuf.draw(regs.num_indices, regs.num_instances.NumInstances(), vertex_offset,
                     instance_offset);
     }
+    EndZpassQuery(cmdbuf, zpass_query);
     DebugState.IncDrawCall();
 
+    CapturePassImages(pipeline);
     ResetBindings(false);
     // The flushes submit; they must not run under the guest-copy shared lock.
     copy_scope.reset();
@@ -835,6 +1760,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     if (!FilterDraw()) {
         return;
     }
+    ++zpass_draws;
 
     const DrawIndirectParams params = {
         .vertex_sgpr_offset = vertex_sgpr_offset,
@@ -842,7 +1768,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         .is_indirect = true,
     };
     const GraphicsPipeline* pipeline = pipeline_cache.GetGraphicsPipeline(params);
-    if (!pipeline) {
+    if (!pipeline || ShouldSkipPipeline(pipeline)) {
         return;
     }
     if (Gr2Fsr3::OnDraw(*pipeline, *liverpool, *this, true)) {
@@ -897,6 +1823,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
     const auto cmdbuf = scheduler.CommandBuffer();
     BindPipelineDedup(vk::PipelineBindPoint::eGraphics, pipeline->Handle());
 
+    const auto zpass_query = BeginZpassQuery(cmdbuf);
     if (is_indexed) {
         ASSERT(sizeof(VkDrawIndexedIndirectCommand) == stride);
 
@@ -918,7 +1845,9 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
         }
         DebugState.IncDrawCall();
     }
+    EndZpassQuery(cmdbuf, zpass_query);
 
+    CapturePassImages(pipeline);
     ResetBindings(false);
 }
 
@@ -930,7 +1859,7 @@ void Rasterizer::DispatchDirect() {
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
-    if (!pipeline) {
+    if (!pipeline || ShouldSkipPipeline(pipeline)) {
         return;
     }
 
@@ -964,6 +1893,14 @@ void Rasterizer::DispatchDirect() {
     cmdbuf.dispatch(cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
     DebugState.IncDispatch();
 
+    if (const u64 capture_hash = pass_capture_buffer_hash.load(std::memory_order_relaxed);
+        capture_hash != 0 && cs.pgm_hash == capture_hash &&
+        pass_capture_buffer_remaining.load(std::memory_order_relaxed) != 0) {
+        LOG_INFO(Render_Vulkan, "[DISPATCHARGS] cs={:#x} direct_dims={} {} {}", capture_hash,
+                 cs_program.dim_x, cs_program.dim_y, cs_program.dim_z);
+    }
+
+    CapturePassImages(pipeline);
     ResetBindings(true);
     // The flushes submit; they must not run under the guest-copy shared lock.
     copy_scope.reset();
@@ -981,7 +1918,7 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
 
     const auto& cs_program = liverpool->GetCsRegs();
     const ComputePipeline* pipeline = pipeline_cache.GetComputePipeline();
-    if (!pipeline) {
+    if (!pipeline || ShouldSkipPipeline(pipeline)) {
         return;
     }
     if (segment_copy_hold_ && in_packet_run_) {
@@ -1009,6 +1946,32 @@ void Rasterizer::DispatchIndirect(VAddr address, u32 offset, u32 size) {
     cmdbuf.dispatchIndirect(buffer->Handle(), base);
     DebugState.IncDispatch();
 
+    if (const u64 capture_hash = pass_capture_buffer_hash.load(std::memory_order_relaxed);
+        capture_hash != 0 &&
+        pipeline->GetStage(Shader::SwStage::Compute).pgm_hash == capture_hash &&
+        pass_capture_buffer_remaining.load(std::memory_order_relaxed) != 0) {
+        auto& staging_pool = runtime.GetStagingPool();
+        const auto download =
+            staging_pool.Request(size, VideoCore::MemoryType::HostCached, 16, true);
+        const std::array copy{vk::BufferCopy{
+            .srcOffset = base,
+            .dstOffset = download.offset,
+            .size = size,
+        }};
+        runtime.CopyBuffer(buffer, download.buffer, copy);
+        const u32 dim_x = cs_program.dim_x;
+        const u32 dim_y = cs_program.dim_y;
+        const u32 dim_z = cs_program.dim_z;
+        scheduler.DeferOperation([&staging_pool, download, capture_hash, dim_x, dim_y, dim_z] {
+            download.Invalidate();
+            const u32* args = std::bit_cast<const u32*>(download.mapped);
+            LOG_INFO(Render_Vulkan, "[DISPATCHARGS] cs={:#x} gpu_args={} {} {} cpu_dims={} {} {}",
+                     capture_hash, args[0], args[1], args[2], dim_x, dim_y, dim_z);
+            staging_pool.FreeDeferred(download);
+        });
+    }
+
+    CapturePassImages(pipeline);
     ResetBindings(true);
 }
 
@@ -1028,6 +1991,7 @@ void Rasterizer::FlushPeriodically() {
 u64 Rasterizer::Flush() {
     DropCopyHold(hold_drops_wait_);
     const u64 current_tick = scheduler.CurrentTick();
+    zpass_dump_pending = false;
     SubmitInfo info{};
     scheduler.Flush(info);
     return current_tick;
@@ -1094,6 +2058,12 @@ void Rasterizer::OnFence() {
         DropCopyHold(hold_drops_wait_);
     }
     texture_cache.ProcessDownloadImages();
+}
+
+void Rasterizer::OnGpuIdle() {
+    if (std::exchange(zpass_dump_pending, false)) {
+        scheduler.Flush();
+    }
 }
 
 void Rasterizer::EmitSkipcacheTelemetry(Skipcache::Framework& skipcache) {
@@ -1597,6 +2567,7 @@ bool Rasterizer::BindResources(const Pipeline* pipeline) {
     }
 
     if (uses_dma) {
+        ZoneScopedN("SynchronizeDmaBuffers");
         buffer_cache.SynchronizeDmaBuffers();
     }
 
@@ -1713,6 +2684,7 @@ void Rasterizer::ReadVertexLayout(const GraphicsPipeline* pipeline,
 }
 
 void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
+    RENDERER_TRACE;
     const auto& regs = liverpool->regs;
     VertexInputs<vk::VertexInputAttributeDescription2EXT> attributes;
     VertexInputs<vk::VertexInputBindingDescription2EXT> bindings;
@@ -1835,6 +2807,7 @@ void Rasterizer::BindVertexBuffers(const GraphicsPipeline* pipeline) {
 }
 
 void Rasterizer::BindIndexBuffer(u32 index_offset, bool is_indirect) {
+    RENDERER_TRACE;
     const auto& regs = liverpool->regs;
 
     // Figure out index type and size.
@@ -1893,6 +2866,7 @@ void Rasterizer::StampBoundWrites(bool mark) {
 }
 
 void Rasterizer::ResetBindings(bool is_compute) {
+    RENDERER_TRACE;
     for (auto& image_id : bound_images) {
         auto& image = texture_cache.GetImage(image_id);
         if (image.binding.is_target || image.binding.is_storage) {
@@ -2187,6 +3161,13 @@ void Rasterizer::BindBuffers(const Shader::Info& stage, Shader::Backend::Binding
                 buffer_infos[info_n++] =
                     vk::DescriptorBufferInfo{buffer->Handle(), offset_aligned, size + adjust};
                 bound_buffers.emplace_back(buffer, offset, size, src_access);
+                if (const u64 capture_hash =
+                        pass_capture_buffer_hash.load(std::memory_order_relaxed);
+                    capture_hash != 0 && stage.pgm_hash == capture_hash &&
+                    pass_capture_buffer_remaining.load(std::memory_order_relaxed) != 0) {
+                    capture_buffers.push_back(
+                        {binding.buffer, vsharp.base_address, size, buffer, offset});
+                }
                 if (desc.is_written) {
                     // Raw storage-buffer writes can also make an aliased cached image stale.
                     texture_cache.InvalidateMemoryFromGPU(vsharp.base_address, size);
@@ -3487,7 +4468,10 @@ void Rasterizer::UpdateDepthStencilState() const {
     }
 
     const auto stencil_test_enabled =
-        regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid();
+        regs.depth_control.stencil_enable && regs.depth_buffer.StencilValid() &&
+        !(ignore_float_target_stencil &&
+          regs.color_buffers[0].GetDataFmt() == AmdGpu::DataFormat::Format16_16_16_16) &&
+        !(ignore_stencil_readers && !regs.depth_control.depth_write_enable);
     dynamic_state.SetStencilTestEnabled(stencil_test_enabled);
     if (stencil_test_enabled) {
         const StencilOps front_ops{

@@ -203,6 +203,7 @@ struct HwFragmentRuntimeInfo {
     u32 num_inputs;
     std::array<PsInput, 32> inputs;
     std::array<PsColorBuffer, MaxColorBuffers> color_buffers;
+    u32 cb_shader_mask{};
     AmdGpu::ShaderExportFormat z_export_format : 4;
     u32 num_samples : 8;
     u32 mrtz_mask : 4;
@@ -228,6 +229,7 @@ struct HwFragmentRuntimeInfo {
         return en_flags == other.en_flags && addr_flags == other.addr_flags &&
                num_inputs == other.num_inputs && z_export_format == other.z_export_format &&
                num_samples == other.num_samples && mrtz_mask == other.mrtz_mask &&
+               cb_shader_mask == other.cb_shader_mask &&
                front_face_all_bits == other.front_face_all_bits &&
                dual_source_blending == other.dual_source_blending &&
                clip_distance_emulation == other.clip_distance_emulation &&
